@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>E2E Stitch Verification</title>
+</head>
+<body>
+<div id="status">Testing...</div>
+<script type="module">
+function logMsg(msg, data) {
+  console.log(msg, data);
+  fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+window.addEventListener('error', (e) => {
+  logMsg('WINDOW_ERROR: ' + e.message, { filename: e.filename, lineno: e.lineno, colno: e.colno });
+});
+
+window.addEventListener('unhandledrejection', (e) => {
+  logMsg('UNHANDLED_REJECTION: ' + (e.reason?.message || String(e.reason)), { stack: e.reason?.stack });
+});
+
+logMsg('Script started');
+
+import { runPipeline } from '../src/core/pipeline.ts';
+
+async function runTest() {
+  logMsg('runTest started');
+  const report = {
+    steps: [],
+    errors: [],
+    success: false,
+    orderRestored: false,
+    finalWidth: 0,
+    finalHeight: 0,
+    dataUrl: null
+  };
+
+  try {
+    const shuffledNames = [
+      'image_part3.png',
+      'image_part1.png',
+      'image_part4.png',
+      'image_part2.png'
+    ];
+
+    const imageItems = [];
+
+    for (let name of shuffledNames) {
+      logMsg('Fetching ' + name);
+      const res = await fetch('/fixtures/' + name);
+      const blob = await res.blob();
+      const bitmap = await createImageBitmap(blob);
+
+      imageItems.push({
+        id: name.replace('.png', ''),
+        file: new File([blob], name, { type: 'image/png' }),
+        name: name,
+        width: bitmap.width,
+        height: bitmap.height,
+        size: blob.size,
+        dataUrl: '',
+        originalBitmap: bitmap,
+        blackBorderTop: 0,
+        blackBorderBottom: 0,
+        blackBorderLeft: 0,
+        blackBorderRight: 0,
+        locked: false
+      });
+    }
+
+    logMsg('Images loaded, calling runPipeline...');
+
+    const pipelineResult = await runPipeline(
+      imageItems,
+      {
+        autoSort: true,
+        removeBlackBorders: true,
+        autoAlign: true,
+        removeDuplicates: true,
+        enableOCR: false
+      },
+      {
+        onProgress: (step, pct, msg, engine) => {
+          logMsg(`PROGRESS: [${step}] ${pct}%: ${msg} (${engine || ''})`);
+          report.steps.push(`[${step}] ${pct}%: ${msg} (${engine || ''})`);
+        },
+        onError: (err) => {
+          logMsg('PIPELINE_ONERROR: ' + err.message);
+          report.errors.push(err.message);
+        },
+        isCancelled: () => false
+      },
+      '#ffffff'
+    );
+
+    logMsg('runPipeline returned', { hasResult: !!pipelineResult });
+
+    if (!pipelineResult) {
+      throw new Error('Pipeline returned null');
+    }
+
+    const { groups, stitchedCanvases, engineUsed } = pipelineResult;
+    report.engineUsed = engineUsed;
+
+    const group0 = groups[0];
+    report.finalOrder = group0.imageIds;
+
+    const expected = ['image_part1', 'image_part2', 'image_part3', 'image_part4'];
+    const isCorrect = JSON.stringify(group0.imageIds) === JSON.stringify(expected);
+    report.orderRestored = isCorrect;
+
+    const canvas = stitchedCanvases.get(group0.id);
+    if (!canvas) {
+      throw new Error('No canvas found for group 0');
+    }
+
+    report.finalWidth = canvas.width;
+    report.finalHeight = canvas.height;
+
+    logMsg('Converting canvas to blob...');
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      report.dataUrl = reader.result;
+      report.success = true;
+      logMsg('Sending final test-result...');
+      fetch('/test-result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(report)
+      });
+    };
+    reader.readAsDataURL(blob);
+
+  } catch (err) {
+    logMsg('CATCH_ERROR: ' + err.message, { stack: err.stack });
+    report.errors.push(err.message);
+    fetch('/test-result', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report)
+    });
+  }
+}
+
+runTest();
+</script>
+</body>
+</html>

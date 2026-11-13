@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="status">Testing Mat readiness...</div>
+<script>
+const start = performance.now();
+const script = document.createElement('script');
+script.src = '/smart-image-stitcher/vendor/opencv.js';
+
+script.onload = () => {
+  const loadTime = Math.round(performance.now() - start);
+
+  let tries = 0;
+  const poll = setInterval(() => {
+    tries++;
+    const cv = window.cv;
+    const hasMat = cv && typeof cv.Mat === 'function';
+    const elapsed = Math.round(performance.now() - start);
+
+    if (hasMat || tries > 80) {
+      clearInterval(poll);
+      fetch('/debug-log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          loadTime,
+          elapsed,
+          hasMat,
+          matType: typeof cv?.Mat,
+          orbType: typeof cv?.ORB,
+          matFromImageDataType: typeof cv?.matFromImageData
+        })
+      });
+    }
+  }, 100);
+};
+
+document.head.appendChild(script);
+</script>
+</body>
+</html>

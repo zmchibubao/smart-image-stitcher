@@ -32,7 +32,7 @@ async function fileToThumbnail(
       const ctx = canvas.getContext('2d')!
       ctx.drawImage(img, 0, 0, w, h)
       resolve({
-        dataUrl: canvas.toDataURL('image/jpeg', 0.8),
+        dataUrl: canvas.toDataURL('image/jpeg', 0.85),
         width: img.width,
         height: img.height,
       })
@@ -40,7 +40,7 @@ async function fileToThumbnail(
     }
     img.onerror = () => {
       URL.revokeObjectURL(url)
-      reject(new Error(`Failed to load ${file.name}`))
+      reject(new Error(`读取图片失败: ${file.name}`))
     }
     img.src = url
   })
@@ -57,8 +57,10 @@ export const useImageStore = defineStore('image', () => {
   })
   const manualOrder = ref<string[]>([])
   const autoOrder = ref<string[]>([])
+  const isUserManuallyOrdered = ref(false)
   const isCancelled = ref(false)
   const stitchedCanvases = ref<Map<number, OffscreenCanvas>>(new Map())
+  const activeEngine = ref<'opencv' | 'canvas'>('canvas')
 
   const settings = ref<AppSettings>({
     autoSort: true,
@@ -74,7 +76,7 @@ export const useImageStore = defineStore('image', () => {
     backgroundColor: '#ffffff',
   })
 
-  // Ordered images for display
+  // 用户可见的当前图片顺序
   const orderedImages = computed<ImageItem[]>(() => {
     const order = manualOrder.value.length > 0 ? manualOrder.value : images.value.map(i => i.id)
     return order
@@ -83,7 +85,7 @@ export const useImageStore = defineStore('image', () => {
   })
 
   const isProcessing = computed(
-    () => !['idle', 'done', 'error', 'cancelled', 'uploading'].includes(processStatus.value.step)
+    () => !['idle', 'done', 'error', 'cancelled'].includes(processStatus.value.step)
   )
 
   function getMatchBetween(idA: string, idB: string): MatchResult | undefined {
@@ -95,18 +97,19 @@ export const useImageStore = defineStore('image', () => {
   }
 
   async function addImages(files: File[]) {
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      // Skip unsupported types
-      if (!file.type.startsWith('image/')) continue
+    const validFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
+    if (validFiles.length === 0) return
 
+    setProcessStatus({
+      step: 'uploading',
+      progress: 0,
+      message: `正在加载 ${validFiles.length} 张图片...`,
+    })
+
+    for (let i = 0; i < validFiles.length; i++) {
+      const file = validFiles[i]
       const id = generateId()
       try {
-        setProcessStatus({
-          step: 'uploading',
-          progress: Math.round((i / files.length) * 100),
-          message: `正在加载图片 ${i + 1}/${files.length}`,
-        })
         const { dataUrl, width, height } = await fileToThumbnail(file)
         const bitmap = await createImageBitmap(file)
         const item: ImageItem = {
@@ -127,10 +130,21 @@ export const useImageStore = defineStore('image', () => {
         images.value.push(item)
         manualOrder.value.push(id)
       } catch (e) {
-        console.error('Failed to load image', file.name, e)
+        console.error('加载图片失败:', file.name, e)
       }
+
+      setProcessStatus({
+        step: 'uploading',
+        progress: Math.round(((i + 1) / validFiles.length) * 100),
+        message: `已加载 ${i + 1}/${validFiles.length} 张图片`,
+      })
     }
-    setProcessStatus({ step: 'idle', progress: 100, message: `已加载 ${images.value.length} 张图片` })
+
+    setProcessStatus({
+      step: 'idle',
+      progress: 100,
+      message: `就绪，共 ${images.value.length} 张图片`,
+    })
   }
 
   function removeImage(id: string) {
@@ -158,12 +172,14 @@ export const useImageStore = defineStore('image', () => {
     stitchGroups.value = []
     manualOrder.value = []
     autoOrder.value = []
+    isUserManuallyOrdered.value = false
     stitchedCanvases.value.clear()
     processStatus.value = { step: 'idle', progress: 0, message: '等待上传图片' }
   }
 
   function setManualOrder(ids: string[]) {
     manualOrder.value = [...ids]
+    isUserManuallyOrdered.value = true
   }
 
   function moveImage(id: string, newIndex: number) {
@@ -173,11 +189,15 @@ export const useImageStore = defineStore('image', () => {
     order.splice(oldIdx, 1)
     order.splice(newIndex, 0, id)
     manualOrder.value = order
+    isUserManuallyOrdered.value = true
   }
 
   function lockImage(id: string) {
     const img = images.value.find(i => i.id === id)
-    if (img) img.locked = true
+    if (img) {
+      img.locked = true
+      isUserManuallyOrdered.value = true
+    }
   }
 
   function unlockImage(id: string) {
@@ -211,13 +231,21 @@ export const useImageStore = defineStore('image', () => {
     }
   }
 
+  /**
+   * 记录算法排序结果：
+   * 严格保护用户手动设定的顺序，绝不在未授权情况下擅自覆盖用户确认的结果！
+   */
   function setStitchGroups(groups: StitchGroup[]) {
     stitchGroups.value = groups
     const allOrdered: string[] = []
     for (const g of groups) allOrdered.push(...g.imageIds)
     autoOrder.value = allOrdered
-    // Only update manual order if no manual overrides yet
-    manualOrder.value = [...allOrdered]
+
+    // 只有在用户尚未手动调整且没有锁定时，才自动同步到展示序列
+    const hasLocked = images.value.some(i => i.locked)
+    if (!isUserManuallyOrdered.value && !hasLocked) {
+      manualOrder.value = [...allOrdered]
+    }
   }
 
   function setProcessStatus(status: Partial<ProcessStatus>) {
@@ -227,6 +255,7 @@ export const useImageStore = defineStore('image', () => {
   function restoreAutoOrder() {
     if (autoOrder.value.length > 0) {
       manualOrder.value = [...autoOrder.value]
+      isUserManuallyOrdered.value = false
     }
   }
 
@@ -242,7 +271,7 @@ export const useImageStore = defineStore('image', () => {
 
   function cancelProcessing() {
     isCancelled.value = true
-    setProcessStatus({ step: 'cancelled', progress: 0, message: '已取消' })
+    setProcessStatus({ step: 'cancelled', progress: 0, message: '已取消任务' })
   }
 
   function resetCancel() {
@@ -253,6 +282,10 @@ export const useImageStore = defineStore('image', () => {
     stitchedCanvases.value.set(groupId, canvas)
   }
 
+  function setActiveEngine(eng: 'opencv' | 'canvas') {
+    activeEngine.value = eng
+  }
+
   return {
     images,
     matchResults,
@@ -260,10 +293,12 @@ export const useImageStore = defineStore('image', () => {
     processStatus,
     manualOrder,
     autoOrder,
+    isUserManuallyOrdered,
     settings,
     exportOptions,
     isCancelled,
     stitchedCanvases,
+    activeEngine,
     orderedImages,
     isProcessing,
     getMatchBetween,
@@ -284,5 +319,6 @@ export const useImageStore = defineStore('image', () => {
     cancelProcessing,
     resetCancel,
     setStitchedCanvas,
+    setActiveEngine,
   }
 })

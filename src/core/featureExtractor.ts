@@ -1,22 +1,29 @@
 import { loadOpenCV } from '../utils/opencvLoader'
 import type { ORBFeatures, KeyPoint } from '../types'
 
-const MAX_FEATURE_SIZE = 600 // 缩放上限设置为 600px，既能保证极高的关键点精度，又能数十倍加快速度
+const MAX_FEATURE_SIZE = 600
 
 export async function extractORBFeatures(
   bitmap: ImageBitmap,
   imageId: string,
-  maxKeypoints = 300
+  cropTop = 0,
+  cropBottom = 0,
+  cropLeft = 0,
+  cropRight = 0,
+  maxKeypoints = 350
 ): Promise<ORBFeatures> {
   const cv = await loadOpenCV()
 
-  const scale = Math.min(1, MAX_FEATURE_SIZE / Math.max(bitmap.width, bitmap.height))
-  const w = Math.round(bitmap.width * scale)
-  const h = Math.round(bitmap.height * scale)
+  const validW = Math.max(10, bitmap.width - cropLeft - cropRight)
+  const validH = Math.max(10, bitmap.height - cropTop - cropBottom)
+
+  const scale = Math.min(1, MAX_FEATURE_SIZE / Math.max(validW, validH))
+  const w = Math.round(validW * scale)
+  const h = Math.round(validH * scale)
 
   const osc = new OffscreenCanvas(w, h)
   const ctx = osc.getContext('2d') as OffscreenCanvasRenderingContext2D
-  ctx.drawImage(bitmap, 0, 0, w, h)
+  ctx.drawImage(bitmap, cropLeft, cropTop, validW, validH, 0, 0, w, h)
   const imageData = ctx.getImageData(0, 0, w, h)
 
   let src: any = null
@@ -52,8 +59,8 @@ export async function extractORBFeatures(
     for (let i = 0; i < kpCount; i++) {
       const kp = kpVec.get(i)
       keypoints.push({
-        x: kp.pt.x / scale,
-        y: kp.pt.y / scale,
+        x: kp.pt.x / scale + cropLeft,
+        y: kp.pt.y / scale + cropTop,
         size: kp.size,
         angle: kp.angle,
         response: kp.response,

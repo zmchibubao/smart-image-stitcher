@@ -1,22 +1,34 @@
 /**
- * Main processing pipeline coordinator.
- * Runs feature extraction, matching, ordering, border detection, and stitching.
+ * 智能流水线调度器 (Smart Pipeline Coordinator)
+ * 具备双引擎架构：
+ * 1. 深度引擎：OpenCV.js (ORB 特征提取 + RANSAC 对齐)
+ * 2. 备用引擎：HTML5 Canvas (2D 文本笔画与前景匹配)
+ *
+ * 保证零阻塞、百分之百可用、平滑回退、严格遵循用户设定。
  */
-import { loadOpenCV } from '../utils/opencvLoader'
+
+import { isCVReady } from '../utils/opencvLoader'
 import { extractORBFeatures } from './featureExtractor'
 import { matchImages } from './imageMatcher'
+import { extractCanvasFeatures, matchImagesCanvas } from './canvasFallbackMatcher'
 import { solveOrder, detectDuplicates } from './orderSolver'
 import { removeBlackBorders } from './blackBorderRemover'
 import { stitchGroup } from './stitcher'
-import type { ImageItem, MatchResult, AppSettings } from '../types'
+import type { ImageItem, MatchResult, AppSettings, StitchGroup } from '../types'
 
 export interface PipelineCallbacks {
-  onProgress: (step: string, progress: number, message: string) => void
+  onProgress: (step: string, progress: number, message: string, engine?: 'opencv' | 'canvas') => void
   onError: (err: Error) => void
   isCancelled: () => boolean
 }
 
-// 调度让出主线程，确保浏览器保持流畅渲染与响应
+export interface PipelineResult {
+  groups: StitchGroup[]
+  matchResults: MatchResult[]
+  stitchedCanvases: Map<number, OffscreenCanvas>
+  engineUsed: 'opencv' | 'canvas'
+}
+
 function yieldToMain(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0))
 }
@@ -25,26 +37,35 @@ export async function runPipeline(
   images: ImageItem[],
   settings: AppSettings,
   callbacks: PipelineCallbacks,
-  exportBg: string
-) {
+  exportBg: string,
+  userLockedOrder?: string[]
+): Promise<PipelineResult | null> {
   const { onProgress, onError, isCancelled } = callbacks
+  if (images.length === 0) return null
 
-  if (images.length === 0) return
+  let engine: 'opencv' | 'canvas' = 'canvas'
 
   try {
-    // --- Step 1: 异步加载 OpenCV 并给与明确进度通知 ---
-    onProgress('loading-cv', 10, '正在加载计算机视觉引擎 (OpenCV.js)...')
-    await yieldToMain()
-    await loadOpenCV()
-    if (isCancelled()) return
-    onProgress('loading-cv', 100, '计算机视觉引擎已就绪')
+    // --- Step 1: 确定图像计算引擎 ---
+    onProgress('loading-cv', 10, '检查视觉引擎状态...')
     await yieldToMain()
 
-    // --- Step 2: 检测与去除黑边 ---
+    if (isCVReady()) {
+      engine = 'opencv'
+      onProgress('loading-cv', 100, '计算机视觉引擎 (OpenCV.js) 就绪', 'opencv')
+    } else {
+      // 优先启用原生轻量高性能 Canvas 引擎，杜绝主线程卡死
+      engine = 'canvas'
+      onProgress('loading-cv', 100, '已启用原生高性能 Canvas 图像引擎', 'canvas')
+    }
+    await yieldToMain()
+    if (isCancelled()) return null
+
+    // --- Step 2: 黑边与无效区域检测 ---
     if (settings.removeBlackBorders) {
-      onProgress('detecting-borders', 0, '正在检测黑边与无效区域...')
+      onProgress('detecting-borders', 0, '正在智能检测黑边与多余边框...', engine)
       for (let i = 0; i < images.length; i++) {
-        if (isCancelled()) return
+        if (isCancelled()) return null
         const img = images[i]
         if (!img.originalBitmap) continue
 
@@ -55,45 +76,73 @@ export async function runPipeline(
           img.blackBorderLeft = borders.left
           img.blackBorderRight = borders.right
         } catch (e) {
-          console.warn('Border detection failed for', img.name, e)
+          console.warn('Black border removal failed for', img.name, e)
         }
 
         onProgress(
           'detecting-borders',
           Math.round(((i + 1) / images.length) * 100),
-          `检测黑边 ${i + 1}/${images.length}`
+          `黑边检测 ${i + 1}/${images.length}`,
+          engine
         )
         await yieldToMain()
       }
     }
 
-    // --- Step 3: 提取 ORB 特征 ---
-    onProgress('extracting-features', 0, '正在分析图片特征...')
+    // --- Step 3: 特征提取 ---
+    onProgress('extracting-features', 0, '正在分析图片内容特征...', engine)
     for (let i = 0; i < images.length; i++) {
-      if (isCancelled()) return
+      if (isCancelled()) return null
       const img = images[i]
       if (!img.originalBitmap) continue
 
-      if (!img.features) {
-        try {
-          const features = await extractORBFeatures(img.originalBitmap, img.id)
-          img.features = features
-        } catch (e) {
-          console.warn('Feature extraction failed for', img.name, e)
+      if (engine === 'opencv') {
+        if (!img.features) {
+          try {
+            img.features = await extractORBFeatures(
+              img.originalBitmap,
+              img.id,
+              img.blackBorderTop,
+              img.blackBorderBottom,
+              img.blackBorderLeft,
+              img.blackBorderRight
+            )
+          } catch (e) {
+            console.warn('ORB 特征提取异常，降级为 Canvas 特征:', e)
+            img.canvasFeature = await extractCanvasFeatures(
+              img.originalBitmap,
+              img.id,
+              img.blackBorderTop,
+              img.blackBorderBottom,
+              img.blackBorderLeft,
+              img.blackBorderRight
+            )
+          }
+        }
+      } else {
+        if (!img.canvasFeature) {
+          img.canvasFeature = await extractCanvasFeatures(
+            img.originalBitmap,
+            img.id,
+            img.blackBorderTop,
+            img.blackBorderBottom,
+            img.blackBorderLeft,
+            img.blackBorderRight
+          )
         }
       }
 
       onProgress(
         'extracting-features',
         Math.round(((i + 1) / images.length) * 100),
-        `提取特征 ${i + 1}/${images.length}: ${img.name}`
+        `提取特征 ${i + 1}/${images.length}: ${img.name}`,
+        engine
       )
-      // 每张提取完都释放一次主线程，UI 进度条平滑刷新
       await yieldToMain()
     }
 
-    // --- Step 4: 两两匹配与几何估计 ---
-    onProgress('matching', 0, '正在智能比对图片重叠区域...')
+    // --- Step 4: 两两匹配与重叠几何估计 ---
+    onProgress('matching', 0, '正在比对重叠区域与阅读顺序...', engine)
     const matchResults: MatchResult[] = []
     const pairs: [number, number][] = []
 
@@ -105,60 +154,86 @@ export async function runPipeline(
 
     const totalPairs = Math.max(1, pairs.length)
     for (let p = 0; p < pairs.length; p++) {
-      if (isCancelled()) return
+      if (isCancelled()) return null
       const [i, j] = pairs[p]
       const imgA = images[i]
       const imgB = images[j]
 
-      if (imgA.features && imgB.features) {
-        try {
-          const result = await matchImages(
+      try {
+        let matchRes: MatchResult | null = null
+
+        if (engine === 'opencv' && imgA.features && imgB.features) {
+          const hA = Math.max(10, imgA.height - imgA.blackBorderTop - imgA.blackBorderBottom)
+          const hB = Math.max(10, imgB.height - imgB.blackBorderTop - imgB.blackBorderBottom)
+          matchRes = await matchImages(
             imgA.id,
             imgA.features,
-            imgA.height,
+            hA,
             imgB.id,
             imgB.features,
-            imgB.height
+            hB
           )
-          if (result.confidence !== 'none') {
-            matchResults.push(result)
-          }
-        } catch (e) {
-          console.warn('Match failed:', imgA.name, imgB.name, e)
+        } else if (imgA.canvasFeature && imgB.canvasFeature) {
+          matchRes = await matchImagesCanvas(imgA.canvasFeature, imgB.canvasFeature)
         }
+
+        if (matchRes && matchRes.confidence !== 'none') {
+          matchResults.push(matchRes)
+        }
+      } catch (e) {
+        console.warn('Pair matching failed:', imgA.name, imgB.name, e)
       }
 
       onProgress(
         'matching',
         Math.round(((p + 1) / totalPairs) * 100),
-        `比对进度 ${p + 1}/${totalPairs}`
+        `比对进度 ${p + 1}/${totalPairs}`,
+        engine
       )
-      // 每次两两比对后都让出主线程，完全杜绝浏览器页面无响应
       await yieldToMain()
     }
 
-    // --- Step 5: 全局推断顺序与独立组识别 ---
-    onProgress('ordering', 50, '正在推断全局阅读顺序...')
+    // --- Step 5: 全局排序求解 ---
+    onProgress('ordering', 50, '正在推断全局阅读顺序...', engine)
     await yieldToMain()
-    const groups = solveOrder(images, matchResults)
 
-    // 重复图片检测
+    let groups: StitchGroup[] = []
+
+    if (settings.autoSort) {
+      const lockedPositions = new Map<string, number>()
+      if (userLockedOrder && userLockedOrder.length > 0) {
+        for (let idx = 0; idx < userLockedOrder.length; idx++) {
+          const id = userLockedOrder[idx]
+          const targetImg = images.find(img => img.id === id)
+          if (targetImg?.locked) {
+            lockedPositions.set(id, idx)
+          }
+        }
+      }
+
+      groups = solveOrder(images, matchResults, lockedPositions.size > 0 ? lockedPositions : undefined)
+    } else {
+      const manualIds = images.map(i => i.id)
+      groups = [{ id: 0, imageIds: manualIds, matches: matchResults }]
+    }
+
+    // 重复图片标记
     const duplicates = detectDuplicates(images, matchResults)
     for (const id of duplicates) {
       const img = images.find(item => item.id === id)
       if (img) img.isDuplicate = true
     }
 
-    onProgress('ordering', 100, `识别到 ${groups.length} 个独立拼接组`)
+    onProgress('ordering', 100, `推断完成，发现 ${groups.length} 个独立拼接组`, engine)
     await yieldToMain()
-    if (isCancelled()) return
+    if (isCancelled()) return null
 
-    // --- Step 6: 执行最终无缝长图拼接 ---
-    onProgress('stitching', 0, '正在生成无缝长图...')
+    // --- Step 6: 自动对齐与无缝拼接 ---
+    onProgress('stitching', 0, '正在合成高清长图...', engine)
     const stitchedCanvases = new Map<number, OffscreenCanvas>()
 
     for (let gi = 0; gi < groups.length; gi++) {
-      if (isCancelled()) return
+      if (isCancelled()) return null
       const group = groups[gi]
 
       try {
@@ -169,23 +244,25 @@ export async function runPipeline(
           {
             removeBlackBorders: settings.removeBlackBorders,
             removeDuplicates: settings.removeDuplicates,
+            autoAlign: settings.autoAlign,
             backgroundColor: exportBg,
           }
         )
         stitchedCanvases.set(group.id, result.canvas)
       } catch (e) {
-        console.error('Stitch failed for group', group.id, e)
+        console.error('Group stitching error:', group.id, e)
       }
 
       onProgress(
         'stitching',
         Math.round(((gi + 1) / groups.length) * 100),
-        `拼接完成第 ${gi + 1}/${groups.length} 组`
+        `拼接完成第 ${gi + 1}/${groups.length} 组`,
+        engine
       )
       await yieldToMain()
     }
 
-    return { groups, matchResults, stitchedCanvases }
+    return { groups, matchResults, stitchedCanvases, engineUsed: engine }
   } catch (err) {
     onError(err instanceof Error ? err : new Error(String(err)))
     return null

@@ -2,25 +2,27 @@
 import { computed } from 'vue'
 import { useImageStore } from '../stores/imageStore'
 import { runPipeline } from '../core/pipeline'
+import { loadOpenCV, resetOpenCVLoader } from '../utils/opencvLoader'
 
 const store = useImageStore()
 
 const isRunning = computed(() => store.isProcessing)
+
 const stepLabel = computed(() => {
   const s = store.processStatus
   const labels: Record<string, string> = {
-    idle: '待机',
+    idle: '待机就绪',
     uploading: '加载图片',
-    'loading-cv': '加载OpenCV',
-    'extracting-features': '提取特征',
-    ocr: 'OCR识别',
-    matching: '图像匹配',
-    ordering: '推断顺序',
-    'detecting-borders': '检测黑边',
-    stitching: '拼接图片',
-    done: '完成',
-    error: '错误',
-    cancelled: '已取消',
+    'loading-cv': '初始化视觉引擎',
+    'extracting-features': '分析图像特征',
+    ocr: 'OCR文字识别',
+    matching: '计算重叠关系',
+    ordering: '推断排列顺序',
+    'detecting-borders': '清理无效黑边',
+    stitching: '合成无缝长图',
+    done: '拼接完成',
+    error: '处理异常',
+    cancelled: '已取消任务',
   }
   return labels[s.step] || s.step
 })
@@ -48,9 +50,9 @@ async function startProcessing() {
   if (store.images.length < 1) return
 
   store.resetCancel()
-  store.setProcessStatus({ step: 'loading-cv', progress: 0, message: '初始化中...' })
+  store.setProcessStatus({ step: 'loading-cv', progress: 0, message: '正在启动处理流水线...' })
 
-  // Get ordered images for processing
+  // 获取当前用户确认的图片队列
   const orderedIds = store.manualOrder.length > 0
     ? store.manualOrder
     : store.images.map(i => i.id)
@@ -62,7 +64,8 @@ async function startProcessing() {
     orderedImages,
     store.settings,
     {
-      onProgress: (step, progress, message) => {
+      onProgress: (step, progress, message, engine) => {
+        if (engine) store.setActiveEngine(engine)
         store.setProcessStatus({ step: step as any, progress, message })
       },
       onError: (err) => {
@@ -70,10 +73,12 @@ async function startProcessing() {
       },
       isCancelled: () => store.isCancelled,
     },
-    store.exportOptions.backgroundColor
+    store.exportOptions.backgroundColor,
+    store.manualOrder
   )
 
   if (result && !store.isCancelled) {
+    store.setActiveEngine(result.engineUsed)
     store.setStitchGroups(result.groups)
     for (const m of result.matchResults || []) {
       store.setMatchResult(m)
@@ -81,34 +86,65 @@ async function startProcessing() {
     for (const [gid, canvas] of result.stitchedCanvases) {
       store.setStitchedCanvas(gid, canvas)
     }
-    store.setProcessStatus({ step: 'done', progress: 100, message: '拼接完成！' })
+    store.setProcessStatus({
+      step: 'done',
+      progress: 100,
+      message: `长图拼接完成！已生成 ${result.groups.length} 组高清长图`,
+    })
   }
 }
 
 function cancelProcessing() {
   store.cancelProcessing()
 }
+
+async function retryOpenCV() {
+  resetOpenCVLoader()
+  try {
+    store.setProcessStatus({ step: 'loading-cv', progress: 10, message: '正在重新加载 OpenCV.js...' })
+    await loadOpenCV(10000)
+    store.setActiveEngine('opencv')
+    store.setProcessStatus({ step: 'idle', progress: 0, message: 'OpenCV.js 重新加载成功，可以开始处理' })
+  } catch (err: any) {
+    store.setProcessStatus({ step: 'idle', progress: 0, message: `加载失败: ${err?.message}，已自动启用备用引擎` })
+  }
+}
 </script>
 
 <template>
   <div class="process-panel card">
+    <!-- Engine Status Pill -->
+    <div class="engine-bar">
+      <span class="engine-pill" :class="store.activeEngine === 'opencv' ? 'pill-opencv' : 'pill-canvas'">
+        {{ store.activeEngine === 'opencv' ? '🚀 深度模式 (OpenCV.js 激活)' : '⚡ 高性能模式 (原生 Canvas 引擎)' }}
+      </span>
+      <button
+        v-if="store.activeEngine === 'canvas' && !isRunning"
+        class="btn btn-secondary btn-sm"
+        @click="retryOpenCV"
+        title="尝试加载 OpenCV.js 深度视觉模型"
+      >
+        🔄 尝试加载 OpenCV
+      </button>
+    </div>
+
     <!-- Settings -->
     <div class="settings-row">
-      <label class="toggle-label">
+      <label class="toggle-label" title="自动根据内容重叠推断图片顺序">
         <input type="checkbox" v-model="store.settings.autoSort" />
-        <span class="toggle-text">🔀 自动排序</span>
+        <span class="toggle-text">🔀 自动推断顺序</span>
       </label>
-      <label class="toggle-label">
+      <label class="toggle-label" title="智能识别并裁切截图边缘黑条">
         <input type="checkbox" v-model="store.settings.removeBlackBorders" />
-        <span class="toggle-text">✂️ 去除黑边</span>
+        <span class="toggle-text">✂️ 自动清理黑边</span>
       </label>
-      <label class="toggle-label">
+      <label class="toggle-label" title="检测并去除相邻图片的重复段落/区域">
         <input type="checkbox" v-model="store.settings.removeDuplicates" />
-        <span class="toggle-text">🗑 去除重复</span>
+        <span class="toggle-text">🗑 去除重复区域</span>
       </label>
-      <label class="toggle-label">
+      <label class="toggle-label" title="校正截图间的水平错位">
         <input type="checkbox" v-model="store.settings.autoAlign" />
-        <span class="toggle-text">📐 自动对齐</span>
+        <span class="toggle-text">📐 水平对齐校正</span>
       </label>
     </div>
 
@@ -119,14 +155,14 @@ function cancelProcessing() {
         :disabled="isRunning || store.images.length === 0"
         @click="startProcessing"
       >
-        {{ isRunning ? '处理中...' : '🚀 开始智能分析与拼接' }}
+        {{ isRunning ? '正在处理中...' : '🚀 开始智能分析与拼接' }}
       </button>
       <button
         v-if="isRunning"
         class="btn btn-danger"
         @click="cancelProcessing"
       >
-        取消
+        取消任务
       </button>
     </div>
 
@@ -149,17 +185,17 @@ function cancelProcessing() {
     <div v-if="store.processStatus.step === 'done'" class="results-summary">
       <div class="result-item">
         <span class="result-num">{{ store.images.length }}</span>
-        <span class="result-label">张图片</span>
+        <span class="result-label">张输入图片</span>
       </div>
       <div class="result-sep">→</div>
       <div class="result-item">
         <span class="result-num">{{ store.stitchGroups.length }}</span>
-        <span class="result-label">个拼接组</span>
+        <span class="result-label">个拼接长图组</span>
       </div>
       <div class="result-sep">→</div>
       <div class="result-item">
         <span class="result-num">{{ store.matchResults.filter(m => m.confidence !== 'none').length }}</span>
-        <span class="result-label">个匹配</span>
+        <span class="result-label">处有效重叠</span>
       </div>
     </div>
   </div>
@@ -171,6 +207,45 @@ function cancelProcessing() {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.engine-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
+
+.engine-pill {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.pill-opencv {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.pill-canvas {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+[data-theme='dark'] .pill-opencv {
+  background: #14532d;
+  color: #4ade80;
+}
+
+[data-theme='dark'] .pill-canvas {
+  background: #0c4a6e;
+  color: #38bdf8;
 }
 
 .settings-row {
@@ -248,6 +323,7 @@ function cancelProcessing() {
 
 .progress-message.error {
   color: var(--danger);
+  font-weight: 500;
 }
 
 .results-summary {

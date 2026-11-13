@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Generate Test Images</title>
+</head>
+<body>
+<script>
+// 生成 4 张具有上下重叠的真实学习资料截图
+// 真实内容：英语文本、中文翻译、黄色荧光笔、蓝色高亮、红色圈画标注、上下黑色边框
+const W = 600;
+const H = 500;
+const BLACK_BAR = 30; // 上下各30px黑色边框
+
+const paragraphs = [
+  { en: "1. The quick brown fox jumps over the lazy dog.", zh: "敏捷的棕色狐狸跃过了懒狗。", highlight: "yellow" },
+  { en: "2. Practice makes perfect in language learning.", zh: "熟能生巧是语言学习的真谛。", highlight: null },
+  { en: "3. Deep learning enables computer vision breakthroughs.", zh: "深度学习赋能计算机视觉的重大突破。", highlight: "blue" },
+  { en: "4. Consistency is the key to mastering English vocabulary.", zh: "坚持是掌握英语词汇的关键所在。", highlight: null },
+  { en: "5. Artificial intelligence transforms our daily productivity.", zh: "人工智能正在重塑我们的日常生产力。", highlight: "green" },
+  { en: "6. Never stop exploring the frontiers of technology.", zh: "永不停止对科技前沿的积极探索。", highlight: null },
+  { en: "7. Attention is all you need for sequence models.", zh: "注意力机制是序列建模的核心。", highlight: "yellow" },
+  { en: "8. Continuous integration ensures high software quality.", zh: "持续集成确保了高质量的软件工程。", highlight: null },
+  { en: "9. Keep your passion alive and strive for excellence.", zh: "保持热爱，奔赴山海，追求卓越。", highlight: "blue" }
+];
+
+// 4张图片的内容区间（设置有重叠段落）：
+// 图 1: 段落 1, 2, 3
+// 图 2: 段落 3, 4, 5 (与图1重叠段落3)
+// 图 3: 段落 5, 6, 7 (与图2重叠段落5)
+// 图 4: 段落 7, 8, 9 (与图3重叠段落7)
+
+const slices = [
+  { name: "image_part1.png", paras: [0, 1, 2], circle: 1 },
+  { name: "image_part2.png", paras: [2, 3, 4], circle: 3 },
+  { name: "image_part3.png", paras: [4, 5, 6], circle: 5 },
+  { name: "image_part4.png", paras: [6, 7, 8], circle: 7 }
+];
+
+async function generateAll() {
+  const results = {};
+  for (let sIdx = 0; sIdx < slices.length; sIdx++) {
+    const s = slices[sIdx];
+    const canvas = document.createElement("canvas");
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext("2d");
+
+    // 1. 白底
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, W, H);
+
+    // 2. 绘制文本段落
+    let curY = BLACK_BAR + 40;
+    for (let pIdx of s.paras) {
+      const p = paragraphs[pIdx];
+
+      // 荧光笔高亮
+      if (p.highlight) {
+        ctx.fillStyle = p.highlight === "yellow" ? "rgba(254, 240, 138, 0.6)" :
+                        p.highlight === "blue"   ? "rgba(186, 230, 253, 0.6)" :
+                                                   "rgba(187, 247, 208, 0.6)";
+        ctx.fillRect(40, curY - 20, 500, 55);
+      }
+
+      // 英文
+      ctx.fillStyle = "#1e293b";
+      ctx.font = "bold 16px sans-serif";
+      ctx.fillText(p.en, 50, curY);
+
+      // 中文
+      ctx.fillStyle = "#475569";
+      ctx.font = "14px sans-serif";
+      ctx.fillText(p.zh, 50, curY + 24);
+
+      // 红色手写圈画
+      if (pIdx === s.circle) {
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.85)";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.ellipse(220, curY - 5, 160, 22, -0.05, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // 批注小箭头
+        ctx.fillStyle = "rgba(239, 68, 68, 0.85)";
+        ctx.font = "bold 12px sans-serif";
+        ctx.fillText("★ 核心考点", 390, curY - 15);
+      }
+
+      curY += 105;
+    }
+
+    // 3. 上下黑边 (模拟手机/视频截图黑边)
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, W, BLACK_BAR);
+    ctx.fillRect(0, H - BLACK_BAR, W, BLACK_BAR);
+
+    results[s.name] = canvas.toDataURL("image/png");
+  }
+
+  window.generatedImages = results;
+  document.body.innerText = "DONE: " + Object.keys(results).length;
+}
+
+generateAll();
+</script>
+</body>
+</html>

@@ -8,6 +8,7 @@ export interface ImageItem {
   dataUrl: string               // thumbnail
   originalBitmap?: ImageBitmap
   features?: ORBFeatures
+  canvasFeature?: any
   ocrText?: string
   ocrWords?: OCRWord[]
   blackBorderTop: number

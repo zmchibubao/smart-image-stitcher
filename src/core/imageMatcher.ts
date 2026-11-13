@@ -6,7 +6,7 @@ interface DMatch {
   distance: number
 }
 
-// 快速汉明距离（利用 Lookup Table 避免在密集循环中进行复杂的位运算）
+// 快速汉明距离（利用 Lookup Table 快速统计不同位）
 const POPCNT_LUT = new Uint8Array(256)
 for (let i = 0; i < 256; i++) {
   let count = 0
@@ -27,11 +27,11 @@ function hammingDistance(a: number[], b: number[]): number {
   return dist
 }
 
-// 快速描述子匹配（带上限限制，避免过多特征点引发 N*M 爆炸）
+// 快速描述子匹配 (最多比对最强的 300 个特征点，耗时仅数毫秒)
 function matchDescriptors(descA: number[][], descB: number[][]): DMatch[] {
   const matches: DMatch[] = []
-  const maxA = Math.min(descA.length, 250)
-  const maxB = Math.min(descB.length, 250)
+  const maxA = Math.min(descA.length, 300)
+  const maxB = Math.min(descB.length, 300)
 
   for (let i = 0; i < maxA; i++) {
     let best1 = Infinity
@@ -59,14 +59,14 @@ function matchDescriptors(descA: number[][], descB: number[][]): DMatch[] {
   return matches
 }
 
-// RANSAC 估计平移向量（优化迭代次数为 150，大幅减轻主线程压力）
+// RANSAC 估计平移位移 (tx, ty)
 function estimateTranslationRANSAC(
   kpsA: KeyPoint[],
   kpsB: KeyPoint[],
   matches: DMatch[],
   maxIter = 150,
-  threshold = 10
-): { tx: number; ty: number; inliers: DMatch[]; scale: number } | null {
+  threshold = 12
+): { tx: number; ty: number; inliers: DMatch[] } | null {
   if (matches.length < 4) return null
 
   let bestInliers: DMatch[] = []
@@ -94,8 +94,7 @@ function estimateTranslationRANSAC(
       bestInliers = inliers
     }
 
-    // 如果内点已经超过 70%，可以提前退出循环
-    if (bestInliers.length > matches.length * 0.7) {
+    if (bestInliers.length > matches.length * 0.75) {
       break
     }
   }
@@ -114,7 +113,7 @@ function estimateTranslationRANSAC(
   const tx = sumTx / bestInliers.length
   const ty = sumTy / bestInliers.length
 
-  return { tx, ty, inliers: bestInliers, scale: 1.0 }
+  return { tx, ty, inliers: bestInliers }
 }
 
 export async function matchImages(
@@ -141,8 +140,8 @@ export async function matchImages(
   if (
     !featuresA.descriptors.length ||
     !featuresB.descriptors.length ||
-    featuresA.keypoints.length < 6 ||
-    featuresB.keypoints.length < 6
+    featuresA.keypoints.length < 5 ||
+    featuresB.keypoints.length < 5
   ) {
     return noMatch
   }
@@ -155,16 +154,15 @@ export async function matchImages(
 
   const { tx, ty, inliers } = result
 
-  // 根据内点数与原始特征点比例评估置信度
   const score = Math.min(
     1,
-    inliers.length / Math.min(30, Math.min(featuresA.keypoints.length, featuresB.keypoints.length))
+    inliers.length / Math.min(25, Math.min(featuresA.keypoints.length, featuresB.keypoints.length))
   )
 
   let confidence: MatchResult['confidence'] = 'none'
-  if (score >= 0.5 && inliers.length >= 10) confidence = 'high'
-  else if (score >= 0.25 && inliers.length >= 6) confidence = 'medium'
-  else if (score >= 0.1 && inliers.length >= 4) confidence = 'low'
+  if (score >= 0.40 && inliers.length >= 8) confidence = 'high'
+  else if (score >= 0.20 && inliers.length >= 5) confidence = 'medium'
+  else if (inliers.length >= 4) confidence = 'low'
 
   let direction: MatchResult['direction'] = 'unknown'
   let overlapHeightA = 0
@@ -172,15 +170,19 @@ export async function matchImages(
 
   if (Math.abs(ty) > 15) {
     if (ty < 0) {
+      // ty = ptA.y - ptB.y < 0 => ptB.y > ptA.y => B 在上，A 在下
       direction = 'B_before_A'
-      const bOverlapStart = heightB + ty
-      overlapHeightB = Math.max(0, Math.min(heightB, heightB - bOverlapStart))
-      overlapHeightA = Math.max(0, Math.min(heightA, overlapHeightB))
+      // 重叠高度为 B 的底部与 A 的顶部重叠高度: heightB + ty (ty为负数)
+      const overlapH = Math.max(0, Math.min(heightA, Math.min(heightB, heightB + ty)))
+      overlapHeightB = overlapH
+      overlapHeightA = overlapH
     } else {
+      // ty = ptA.y - ptB.y > 0 => ptA.y > ptB.y => A 在上，B 在下
       direction = 'A_before_B'
-      const aUniqueHeight = ty
-      overlapHeightA = Math.max(0, Math.min(heightA, heightA - aUniqueHeight))
-      overlapHeightB = Math.max(0, Math.min(heightB, overlapHeightA))
+      // 重叠高度为 A 的底部与 B 的顶部重叠高度: heightA - ty
+      const overlapH = Math.max(0, Math.min(heightA, Math.min(heightB, heightA - ty)))
+      overlapHeightA = overlapH
+      overlapHeightB = overlapH
     }
   }
 
