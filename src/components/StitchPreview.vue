@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { useImageStore } from '../stores/imageStore'
 import { renderToCanvas } from '../core/stitcher'
 
@@ -12,20 +12,27 @@ const isLoading = ref(false)
 const groups = computed(() => store.stitchGroups)
 const activeCanvas = computed(() => store.stitchedCanvases.get(activeGroupId.value))
 
-watch([activeCanvas, zoom], async () => {
+async function updatePreview() {
+  await nextTick()
   if (!canvasRef.value || !activeCanvas.value) return
   isLoading.value = true
   try {
     const parentW = canvasRef.value.parentElement?.clientWidth || 800
-    const previewW = Math.round(parentW * Math.min(zoom.value, 1))
+    const previewW = Math.round(parentW * Math.min(zoom.value, 1.5))
     await renderToCanvas(activeCanvas.value, canvasRef.value, previewW)
+  } catch (e) {
+    console.warn('Preview render failed:', e)
   } finally {
     isLoading.value = false
   }
-})
+}
 
-function zoomIn() { zoom.value = Math.min(zoom.value * 1.5, 4) }
-function zoomOut() { zoom.value = Math.max(zoom.value / 1.5, 0.1) }
+watch([activeCanvas, zoom, activeGroupId], () => {
+  updatePreview()
+}, { immediate: true })
+
+function zoomIn() { zoom.value = Math.min(zoom.value * 1.25, 3) }
+function zoomOut() { zoom.value = Math.max(zoom.value / 1.25, 0.2) }
 function resetZoom() { zoom.value = 1 }
 
 const canvasSize = computed(() => {
@@ -53,9 +60,9 @@ const canvasSize = computed(() => {
     <!-- Toolbar -->
     <div class="preview-toolbar">
       <div class="zoom-controls">
-        <button class="btn btn-secondary btn-sm" @click="zoomOut" :disabled="zoom <= 0.1">－</button>
+        <button class="btn btn-secondary btn-sm" @click="zoomOut" :disabled="zoom <= 0.2">－</button>
         <span class="zoom-label">{{ Math.round(zoom * 100) }}%</span>
-        <button class="btn btn-secondary btn-sm" @click="zoomIn" :disabled="zoom >= 4">＋</button>
+        <button class="btn btn-secondary btn-sm" @click="zoomIn" :disabled="zoom >= 3">＋</button>
         <button class="btn btn-secondary btn-sm" @click="resetZoom">重置</button>
       </div>
       <span v-if="canvasSize" class="size-label">{{ canvasSize }}</span>
@@ -63,7 +70,7 @@ const canvasSize = computed(() => {
 
     <!-- Canvas preview -->
     <div class="canvas-wrap">
-      <div v-if="isLoading" class="loading-overlay">渲染中...</div>
+      <div v-if="isLoading" class="loading-overlay">渲染预览中...</div>
       <canvas
         ref="canvasRef"
         class="preview-canvas"

@@ -6,30 +6,41 @@ interface DMatch {
   distance: number
 }
 
-// Hamming distance for binary ORB descriptors
+// 快速汉明距离（利用 Lookup Table 避免在密集循环中进行复杂的位运算）
+const POPCNT_LUT = new Uint8Array(256)
+for (let i = 0; i < 256; i++) {
+  let count = 0
+  let v = i
+  while (v > 0) {
+    count += v & 1
+    v >>= 1
+  }
+  POPCNT_LUT[i] = count
+}
+
 function hammingDistance(a: number[], b: number[]): number {
   let dist = 0
-  for (let i = 0; i < a.length; i++) {
-    let xor = (a[i] ^ b[i]) >>> 0
-    // Popcount
-    xor = xor - ((xor >> 1) & 0x55555555)
-    xor = (xor & 0x33333333) + ((xor >> 2) & 0x33333333)
-    xor = (xor + (xor >> 4)) & 0x0f0f0f0f
-    dist += (xor * 0x01010101) >>> 24
+  const len = Math.min(a.length, b.length)
+  for (let i = 0; i < len; i++) {
+    dist += POPCNT_LUT[a[i] ^ b[i]]
   }
   return dist
 }
 
-// Brute-force nearest neighbor with Lowe's ratio test
+// 快速描述子匹配（带上限限制，避免过多特征点引发 N*M 爆炸）
 function matchDescriptors(descA: number[][], descB: number[][]): DMatch[] {
   const matches: DMatch[] = []
+  const maxA = Math.min(descA.length, 250)
+  const maxB = Math.min(descB.length, 250)
 
-  for (let i = 0; i < descA.length; i++) {
-    let best1 = Infinity, best2 = Infinity
+  for (let i = 0; i < maxA; i++) {
+    let best1 = Infinity
+    let best2 = Infinity
     let bestJ = -1
 
-    for (let j = 0; j < descB.length; j++) {
-      const d = hammingDistance(descA[i], descB[j])
+    const da = descA[i]
+    for (let j = 0; j < maxB; j++) {
+      const d = hammingDistance(da, descB[j])
       if (d < best1) {
         best2 = best1
         best1 = d
@@ -39,7 +50,7 @@ function matchDescriptors(descA: number[][], descB: number[][]): DMatch[] {
       }
     }
 
-    // Lowe's ratio test: 0.75 is standard for ORB
+    // Lowe's ratio test: 0.75
     if (bestJ >= 0 && best1 < best2 * 0.75) {
       matches.push({ queryIdx: i, trainIdx: bestJ, distance: best1 })
     }
@@ -48,13 +59,13 @@ function matchDescriptors(descA: number[][], descB: number[][]): DMatch[] {
   return matches
 }
 
-// RANSAC with translation model (best for document screenshots)
+// RANSAC 估计平移向量（优化迭代次数为 150，大幅减轻主线程压力）
 function estimateTranslationRANSAC(
   kpsA: KeyPoint[],
   kpsB: KeyPoint[],
   matches: DMatch[],
-  maxIter = 500,
-  threshold = 8
+  maxIter = 150,
+  threshold = 10
 ): { tx: number; ty: number; inliers: DMatch[]; scale: number } | null {
   if (matches.length < 4) return null
 
@@ -68,12 +79,13 @@ function estimateTranslationRANSAC(
     const ty = ptA.y - ptB.y
 
     const inliers: DMatch[] = []
-    for (const match of matches) {
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i]
       const pA = kpsA[match.queryIdx]
       const pB = kpsB[match.trainIdx]
       const dx = (pA.x - pB.x) - tx
       const dy = (pA.y - pB.y) - ty
-      if (Math.sqrt(dx * dx + dy * dy) < threshold) {
+      if (dx * dx + dy * dy < threshold * threshold) {
         inliers.push(match)
       }
     }
@@ -81,13 +93,20 @@ function estimateTranslationRANSAC(
     if (inliers.length > bestInliers.length) {
       bestInliers = inliers
     }
+
+    // 如果内点已经超过 70%，可以提前退出循环
+    if (bestInliers.length > matches.length * 0.7) {
+      break
+    }
   }
 
   if (bestInliers.length < 4) return null
 
-  // Refine with inliers (least squares)
-  let sumTx = 0, sumTy = 0
-  for (const m of bestInliers) {
+  // 最小二乘精炼
+  let sumTx = 0
+  let sumTy = 0
+  for (let i = 0; i < bestInliers.length; i++) {
+    const m = bestInliers[i]
     sumTx += kpsA[m.queryIdx].x - kpsB[m.trainIdx].x
     sumTy += kpsA[m.queryIdx].y - kpsB[m.trainIdx].y
   }
@@ -122,56 +141,44 @@ export async function matchImages(
   if (
     !featuresA.descriptors.length ||
     !featuresB.descriptors.length ||
-    featuresA.keypoints.length < 8 ||
-    featuresB.keypoints.length < 8
+    featuresA.keypoints.length < 6 ||
+    featuresB.keypoints.length < 6
   ) {
     return noMatch
   }
 
   const rawMatches = matchDescriptors(featuresA.descriptors, featuresB.descriptors)
-
   if (rawMatches.length < 4) return noMatch
 
   const result = estimateTranslationRANSAC(featuresA.keypoints, featuresB.keypoints, rawMatches)
-
   if (!result) return noMatch
 
   const { tx, ty, inliers } = result
 
-  // Score based on inlier count relative to total keypoints
+  // 根据内点数与原始特征点比例评估置信度
   const score = Math.min(
     1,
-    inliers.length / Math.min(50, Math.min(featuresA.keypoints.length, featuresB.keypoints.length))
+    inliers.length / Math.min(30, Math.min(featuresA.keypoints.length, featuresB.keypoints.length))
   )
 
   let confidence: MatchResult['confidence'] = 'none'
-  if (score >= 0.5 && inliers.length >= 15) confidence = 'high'
-  else if (score >= 0.25 && inliers.length >= 8) confidence = 'medium'
+  if (score >= 0.5 && inliers.length >= 10) confidence = 'high'
+  else if (score >= 0.25 && inliers.length >= 6) confidence = 'medium'
   else if (score >= 0.1 && inliers.length >= 4) confidence = 'low'
 
-  // Direction: ty = how much B is shifted up relative to A
-  // If ty < 0: keypoints of A appear ABOVE corresponding points in B
-  // => A content is higher on screen => A comes before B (A is above B)
-  // If ty > 0: B content is higher => B comes before A
   let direction: MatchResult['direction'] = 'unknown'
   let overlapHeightA = 0
   let overlapHeightB = 0
 
-  if (Math.abs(ty) > 20) {
-    // ty < 0 means A's keypoints have higher Y than B's => B overlaps top portion of A content
-    // actually: tx = kpA.x - kpB.x, ty = kpA.y - kpB.y
-    // If ty > 0: same point in A is LOWER than in B => A is below B => B first
-    // If ty < 0: same point in A is HIGHER than in B => A is above B => A first
+  if (Math.abs(ty) > 15) {
     if (ty < 0) {
       direction = 'B_before_A'
-      // B appears before A. B's bottom overlaps A's top.
-      const bOverlapStart = heightB + ty  // ty is negative
+      const bOverlapStart = heightB + ty
       overlapHeightB = Math.max(0, Math.min(heightB, heightB - bOverlapStart))
       overlapHeightA = Math.max(0, Math.min(heightA, overlapHeightB))
     } else {
       direction = 'A_before_B'
-      // A appears before B. A's bottom overlaps B's top.
-      const aUniqueHeight = ty // how many pixels of A are unique before the overlap
+      const aUniqueHeight = ty
       overlapHeightA = Math.max(0, Math.min(heightA, heightA - aUniqueHeight))
       overlapHeightB = Math.max(0, Math.min(heightB, overlapHeightA))
     }

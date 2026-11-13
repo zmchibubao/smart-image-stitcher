@@ -1,44 +1,43 @@
-let cvLoadPromise: Promise<typeof window.cv> | null = null
+let cvLoadPromise: Promise<any> | null = null
 
-export function loadOpenCV(): Promise<typeof window.cv> {
+export function loadOpenCV(): Promise<any> {
   if (cvLoadPromise) return cvLoadPromise
 
   cvLoadPromise = new Promise((resolve, reject) => {
-    // Already loaded
+    // 1. Check if already loaded
     if (typeof (window as any).cv !== 'undefined' && (window as any).cv.Mat) {
       resolve((window as any).cv)
       return
     }
 
-    // Poll until ready
-    let tries = 0
-    const maxTries = 300 // 150 seconds
+    // 2. Timeout protection (60s)
+    const timeout = setTimeout(() => {
+      clearInterval(poll)
+      reject(new Error('OpenCV.js 加载超时，请检查网络或刷新页面'))
+    }, 60000)
 
-    const poll = () => {
+    // 3. Poll for readiness
+    const poll = setInterval(() => {
       const cv = (window as any).cv
       if (cv && cv.Mat && typeof cv.Mat === 'function') {
+        clearInterval(poll)
+        clearTimeout(timeout)
         resolve(cv)
-        return
       }
-      if (++tries >= maxTries) {
-        reject(new Error('OpenCV.js 加载超时，请检查网络连接后刷新页面'))
-        return
-      }
-      setTimeout(poll, 500)
-    }
+    }, 200)
 
-    // If the script tag fired onload already
-    if ((window as any).cvReady) {
-      poll()
-    } else {
-      // Wait for onOpenCvReady callback
-      const callbacks = (window as any).cvReadyCallbacks
-      if (Array.isArray(callbacks)) {
-        callbacks.push(() => poll())
-      } else {
-        // Fallback: just poll
-        setTimeout(poll, 1000)
+    // 4. Inject script if not present
+    if (!document.getElementById('opencv-script')) {
+      const script = document.createElement('script')
+      script.id = 'opencv-script'
+      script.async = true
+      script.src = 'https://docs.opencv.org/4.8.0/opencv.js'
+      script.onerror = () => {
+        clearInterval(poll)
+        clearTimeout(timeout)
+        reject(new Error('OpenCV.js 脚本加载失败，请检查网络连接'))
       }
+      document.head.appendChild(script)
     }
   })
 
@@ -50,7 +49,6 @@ export function isCVReady(): boolean {
   return !!(cv && cv.Mat && typeof cv.Mat === 'function')
 }
 
-// Declare global cv type
 declare global {
   interface Window {
     cv: any

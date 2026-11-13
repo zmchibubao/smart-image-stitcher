@@ -16,6 +16,11 @@ export interface PipelineCallbacks {
   isCancelled: () => boolean
 }
 
+// 调度让出主线程，确保浏览器保持流畅渲染与响应
+function yieldToMain(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
 export async function runPipeline(
   images: ImageItem[],
   settings: AppSettings,
@@ -27,15 +32,17 @@ export async function runPipeline(
   if (images.length === 0) return
 
   try {
-    // --- Step 1: Load OpenCV ---
-    onProgress('loading-cv', 0, '正在加载 OpenCV.js...')
+    // --- Step 1: 异步加载 OpenCV 并给与明确进度通知 ---
+    onProgress('loading-cv', 10, '正在加载计算机视觉引擎 (OpenCV.js)...')
+    await yieldToMain()
     await loadOpenCV()
     if (isCancelled()) return
-    onProgress('loading-cv', 100, 'OpenCV.js 加载完成')
+    onProgress('loading-cv', 100, '计算机视觉引擎已就绪')
+    await yieldToMain()
 
-    // --- Step 2: Detect black borders ---
+    // --- Step 2: 检测与去除黑边 ---
     if (settings.removeBlackBorders) {
-      onProgress('detecting-borders', 0, '正在检测黑边...')
+      onProgress('detecting-borders', 0, '正在检测黑边与无效区域...')
       for (let i = 0; i < images.length; i++) {
         if (isCancelled()) return
         const img = images[i]
@@ -51,110 +58,103 @@ export async function runPipeline(
           console.warn('Border detection failed for', img.name, e)
         }
 
-        onProgress('detecting-borders', Math.round(((i + 1) / images.length) * 100),
-          `检测黑边 ${i + 1}/${images.length}`)
-      }
-    }
-
-    // --- Step 3: Extract ORB features ---
-    onProgress('extracting-features', 0, '正在提取图像特征...')
-    for (let i = 0; i < images.length; i++) {
-      if (isCancelled()) return
-      const img = images[i]
-      if (!img.originalBitmap) continue
-      if (img.features) {
-        // Already cached
-        onProgress('extracting-features', Math.round(((i + 1) / images.length) * 100),
-          `特征提取 ${i + 1}/${images.length} (已缓存)`)
-        continue
-      }
-
-      try {
-        const features = await extractORBFeatures(img.originalBitmap, img.id)
-        img.features = features
-      } catch (e) {
-        console.warn('Feature extraction failed for', img.name, e)
-      }
-
-      onProgress('extracting-features', Math.round(((i + 1) / images.length) * 100),
-        `特征提取 ${i + 1}/${images.length}: ${img.name}`)
-
-      // Yield to avoid blocking main thread
-      await yieldToMain()
-    }
-
-    // --- Step 4: Pairwise matching ---
-    onProgress('matching', 0, '正在分析图片关系...')
-    
-    // For efficiency, only match images that could plausibly be adjacent
-    // We try all pairs but skip if both have no features
-    const matchResults: MatchResult[] = []
-    const pairs: [number, number][] = []
-    
-    for (let i = 0; i < images.length; i++) {
-      for (let j = 0; j < images.length; j++) {
-        if (i !== j) pairs.push([i, j])
-      }
-    }
-
-    let pairsDone = 0
-    for (const [i, j] of pairs) {
-      if (isCancelled()) return
-
-      const imgA = images[i]
-      const imgB = images[j]
-
-      if (!imgA.features || !imgB.features) {
-        pairsDone++
-        continue
-      }
-
-      // Skip if already computed (symmetric)
-      const existing = matchResults.find(
-        m => (m.imageIdA === imgA.id && m.imageIdB === imgB.id) ||
-             (m.imageIdA === imgB.id && m.imageIdB === imgA.id)
-      )
-      if (existing) {
-        pairsDone++
-        continue
-      }
-
-      try {
-        const result = await matchImages(
-          imgA.id, imgA.features, imgA.height,
-          imgB.id, imgB.features, imgB.height
+        onProgress(
+          'detecting-borders',
+          Math.round(((i + 1) / images.length) * 100),
+          `检测黑边 ${i + 1}/${images.length}`
         )
-        if (result.confidence !== 'none') {
-          matchResults.push(result)
-        }
-      } catch (e) {
-        console.warn('Match failed:', imgA.name, imgB.name, e)
-      }
-
-      pairsDone++
-      if (pairsDone % 5 === 0) {
-        onProgress('matching', Math.round((pairsDone / pairs.length) * 100),
-          `分析图片关系 ${pairsDone}/${pairs.length}`)
         await yieldToMain()
       }
     }
 
-    // --- Step 5: Solve order ---
-    onProgress('ordering', 0, '正在推断图片顺序...')
+    // --- Step 3: 提取 ORB 特征 ---
+    onProgress('extracting-features', 0, '正在分析图片特征...')
+    for (let i = 0; i < images.length; i++) {
+      if (isCancelled()) return
+      const img = images[i]
+      if (!img.originalBitmap) continue
+
+      if (!img.features) {
+        try {
+          const features = await extractORBFeatures(img.originalBitmap, img.id)
+          img.features = features
+        } catch (e) {
+          console.warn('Feature extraction failed for', img.name, e)
+        }
+      }
+
+      onProgress(
+        'extracting-features',
+        Math.round(((i + 1) / images.length) * 100),
+        `提取特征 ${i + 1}/${images.length}: ${img.name}`
+      )
+      // 每张提取完都释放一次主线程，UI 进度条平滑刷新
+      await yieldToMain()
+    }
+
+    // --- Step 4: 两两匹配与几何估计 ---
+    onProgress('matching', 0, '正在智能比对图片重叠区域...')
+    const matchResults: MatchResult[] = []
+    const pairs: [number, number][] = []
+
+    for (let i = 0; i < images.length; i++) {
+      for (let j = i + 1; j < images.length; j++) {
+        pairs.push([i, j])
+      }
+    }
+
+    const totalPairs = Math.max(1, pairs.length)
+    for (let p = 0; p < pairs.length; p++) {
+      if (isCancelled()) return
+      const [i, j] = pairs[p]
+      const imgA = images[i]
+      const imgB = images[j]
+
+      if (imgA.features && imgB.features) {
+        try {
+          const result = await matchImages(
+            imgA.id,
+            imgA.features,
+            imgA.height,
+            imgB.id,
+            imgB.features,
+            imgB.height
+          )
+          if (result.confidence !== 'none') {
+            matchResults.push(result)
+          }
+        } catch (e) {
+          console.warn('Match failed:', imgA.name, imgB.name, e)
+        }
+      }
+
+      onProgress(
+        'matching',
+        Math.round(((p + 1) / totalPairs) * 100),
+        `比对进度 ${p + 1}/${totalPairs}`
+      )
+      // 每次两两比对后都让出主线程，完全杜绝浏览器页面无响应
+      await yieldToMain()
+    }
+
+    // --- Step 5: 全局推断顺序与独立组识别 ---
+    onProgress('ordering', 50, '正在推断全局阅读顺序...')
+    await yieldToMain()
     const groups = solveOrder(images, matchResults)
-    
-    // Detect duplicates
+
+    // 重复图片检测
     const duplicates = detectDuplicates(images, matchResults)
     for (const id of duplicates) {
-      const img = images.find(i => i.id === id)
+      const img = images.find(item => item.id === id)
       if (img) img.isDuplicate = true
     }
 
-    onProgress('ordering', 100, `识别到 ${groups.length} 个图片组`)
+    onProgress('ordering', 100, `识别到 ${groups.length} 个独立拼接组`)
+    await yieldToMain()
     if (isCancelled()) return
 
-    // --- Step 6: Stitch ---
-    onProgress('stitching', 0, '正在拼接图片...')
+    // --- Step 6: 执行最终无缝长图拼接 ---
+    onProgress('stitching', 0, '正在生成无缝长图...')
     const stitchedCanvases = new Map<number, OffscreenCanvas>()
 
     for (let gi = 0; gi < groups.length; gi++) {
@@ -177,18 +177,17 @@ export async function runPipeline(
         console.error('Stitch failed for group', group.id, e)
       }
 
-      onProgress('stitching', Math.round(((gi + 1) / groups.length) * 100),
-        `拼接第 ${gi + 1}/${groups.length} 组`)
+      onProgress(
+        'stitching',
+        Math.round(((gi + 1) / groups.length) * 100),
+        `拼接完成第 ${gi + 1}/${groups.length} 组`
+      )
+      await yieldToMain()
     }
 
     return { groups, matchResults, stitchedCanvases }
-
   } catch (err) {
     onError(err instanceof Error ? err : new Error(String(err)))
     return null
   }
-}
-
-function yieldToMain(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, 0))
 }
