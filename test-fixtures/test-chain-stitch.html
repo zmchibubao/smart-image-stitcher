@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const chain = [
+    { id: 'real_7', cropTop: 32, cropBottom: 32 },
+    { id: 'real_6', cropTop: 32, cropBottom: 32, overlapH: 334, dx: 10, seamCut: 290 },
+    { id: 'real_4', cropTop: 32, cropBottom: 32, overlapH: 99, dx: 0, seamCut: 60 },
+    { id: 'real_5', cropTop: 32, cropBottom: 32, overlapH: 496, dx: 0, seamCut: 80 },
+    { id: 'real_3', cropTop: 32, cropBottom: 32, overlapH: 298, dx: 0, seamCut: 150 },
+    { id: 'real_2', cropTop: 32, cropBottom: 32, overlapH: 448, dx: 0, seamCut: 220 },
+    { id: 'real_1', cropTop: 32, cropBottom: 32, overlapH: 208, dx: 0, seamCut: 100 }
+  ];
+
+  // Load all images
+  const loaded = [];
+  for (const item of chain) {
+    const res = await fetch('/real-img/' + item.id + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    loaded.push({ ...item, bmp });
+  }
+
+  // Calculate layout
+  // Width is 1024 - left - right = 1024
+  // Let's check image dimensions
+  const W = loaded[0].bmp.width;
+  log(`Base image width: ${W}`);
+
+  // Compute total canvas height
+  let totalH = loaded[0].bmp.height - loaded[0].cropTop - loaded[0].cropBottom;
+  for (let i = 1; i < loaded.length; i++) {
+    const item = loaded[i];
+    const itemH = item.bmp.height - item.cropTop - item.cropBottom;
+    const addH = itemH - item.overlapH;
+    totalH += addH;
+  }
+  log(`Calculated stitched total height: ${totalH}px`);
+
+  // Render on offscreen canvas
+  const canvas = new OffscreenCanvas(W, totalH);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, W, totalH);
+
+  let currentY = 0;
+  for (let i = 0; i < loaded.length; i++) {
+    const item = loaded[i];
+    const srcH = item.bmp.height - item.cropTop - item.cropBottom;
+    if (i === 0) {
+      ctx.drawImage(item.bmp, 0, item.cropTop, W, srcH, 0, 0, W, srcH);
+      currentY = srcH;
+    } else {
+      const addH = srcH - item.overlapH;
+      // Draw continuation
+      // From item, we draw from item.cropTop + item.overlapH down to bottom
+      // But wait: seam cut blending!
+      // If we cut at seamCut:
+      // In previous: we kept up to currentY - item.overlapH + item.seamCut
+      // In current: we draw from item.cropTop + item.seamCut downwards!
+      const drawSrcY = item.cropTop + item.overlapH;
+      const drawDstY = currentY;
+      ctx.drawImage(item.bmp, 0, drawSrcY, W, addH, 0, drawDstY, W, addH);
+      currentY += addH;
+    }
+  }
+
+  // Check black rows
+  const imgData = ctx.getImageData(0, 0, W, totalH).data;
+  let darkRows = 0;
+  for (let y = 0; y < totalH; y++) {
+    let darkPx = 0;
+    const offset = y * W * 4;
+    for (let x = 0; x < W; x++) {
+      const r = imgData[offset + x*4];
+      const g = imgData[offset + x*4 + 1];
+      const b = imgData[offset + x*4 + 2];
+      if ((r + g + b) / 3 < 80) darkPx++;
+    }
+    if (darkPx / W > 0.6) darkRows++;
+  }
+  log(`Verification dark rows: ${darkRows}`);
+
+  const blob = await canvas.convertToBlob({ type: 'image/png' });
+  const reader = new FileReader();
+  reader.onloadend = async () => {
+    await fetch('/test-result', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ok: true,
+        totalH,
+        darkRows,
+        canvases: [{ groupId: 0, w: W, h: totalH, dataUrl: reader.result }]
+      })
+    });
+  };
+  reader.readAsDataURL(blob);
+}
+run();
+</script>
+</body>
+</html>

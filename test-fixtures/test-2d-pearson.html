@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const names = ['real_7', 'real_6', 'real_5', 'real_4', 'real_3', 'real_2', 'real_1'];
+  const images = {};
+
+  for (const name of names) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+
+    const validW = bmp.width;
+    const validH = bmp.height - 64;
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, 32, validW, validH, 0, 0, validW, validH);
+    const data = ctx.getImageData(0, 0, validW, validH).data;
+
+    // Ink matrix
+    const ink = new Float32Array(validW * validH);
+    for (let y = 0; y < validH; y++) {
+      const rowOffset = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (rowOffset + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 200) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[rowOffset + x] = val;
+      }
+    }
+    images[name] = { id: name, validW, validH, ink };
+  }
+
+  // 2D Pearson Correlation across the whole overlap window
+  function eval2DPearson(upper, lower, overlap, dx = 0) {
+    const W = upper.validW;
+    const H1 = upper.validH;
+
+    let s1 = 0, s2 = 0, count = 0;
+    for (let y = 0; y < overlap; y += 2) {
+      const r1 = (H1 - overlap + y) * W;
+      const r2 = y * W;
+      for (let x = 80; x < W - 80; x += 4) {
+        s1 += upper.ink[r1 + x];
+        s2 += lower.ink[r2 + x + dx];
+        count++;
+      }
+    }
+    const m1 = s1 / count;
+    const m2 = s2 / count;
+
+    let cov = 0, v1 = 0, v2 = 0;
+    for (let y = 0; y < overlap; y += 2) {
+      const r1 = (H1 - overlap + y) * W;
+      const r2 = y * W;
+      for (let x = 80; x < W - 80; x += 4) {
+        const d1 = upper.ink[r1 + x] - m1;
+        const d2 = lower.ink[r2 + x + dx] - m2;
+        cov += d1 * d2;
+        v1 += d1 * d1;
+        v2 += d2 * d2;
+      }
+    }
+    return (v1 > 100 && v2 > 100) ? cov / (Math.sqrt(v1) * Math.sqrt(v2)) : 0;
+  }
+
+  // Sweep dx for best 2D correlation
+  function best2DPearson(upper, lower, overlap) {
+    let best = -1, bestDx = 0;
+    for (let dx = -10; dx <= 10; dx += 2) {
+      const z = eval2DPearson(upper, lower, overlap, dx);
+      if (z > best) {
+        best = z;
+        bestDx = dx;
+      }
+    }
+    return { z: best, dx: bestDx };
+  }
+
+  // Test true pairs and false pairs
+  const testPairs = [
+    // True pairs
+    { u: 'real_7', l: 'real_6', ov: 390, expect: 'TRUE' },
+    { u: 'real_6', l: 'real_5', ov: 205, expect: 'TRUE' },
+    { u: 'real_5', l: 'real_3', ov: 298, expect: 'TRUE' },
+    { u: 'real_3', l: 'real_2', ov: 448, expect: 'TRUE' },
+    { u: 'real_2', l: 'real_1', ov: 243, expect: 'TRUE' },
+    // False pairs
+    { u: 'real_1', l: 'real_3', ov: 474, expect: 'FALSE' },
+    { u: 'real_1', l: 'real_7', ov: 433, expect: 'FALSE' },
+    { u: 'real_1', l: 'real_4', ov: 460, expect: 'FALSE' },
+    { u: 'real_1', l: 'real_2', ov: 443, expect: 'FALSE' },
+    { u: 'real_7', l: 'real_2', ov: 488, expect: 'FALSE' },
+    { u: 'real_6', l: 'real_2', ov: 451, expect: 'FALSE' },
+    { u: 'real_7', l: 'real_3', ov: 391, expect: 'FALSE' },
+  ];
+
+  for (const tp of testPairs) {
+    const res = best2DPearson(images[tp.u], images[tp.l], tp.ov);
+    log(`2D Pearson [${tp.expect}] ${tp.u} -> ${tp.l} (ov=${tp.ov}):`, res);
+  }
+
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

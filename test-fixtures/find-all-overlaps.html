@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const names = ['real_7', 'real_6', 'real_4', 'real_5', 'real_3', 'real_2', 'real_1'];
+  const images = {};
+
+  for (const name of names) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+
+    const validW = bmp.width;
+    const validH = bmp.height - 64; // crop 32 top, 32 bottom
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, 32, validW, validH, 0, 0, validW, validH);
+    const data = ctx.getImageData(0, 0, validW, validH).data;
+
+    // Ink matrix: binary / continuous ink representation
+    const ink = new Float32Array(validW * validH);
+    for (let y = 0; y < validH; y++) {
+      const rowOffset = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (rowOffset + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 200) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[rowOffset + x] = val;
+      }
+    }
+    images[name] = { id: name, validW, validH, ink };
+  }
+
+  function computeZNCC(upper, lower, overlap, dx = 0) {
+    const W = upper.validW;
+    const H1 = upper.validH;
+    let s1 = 0, s2 = 0, count = 0;
+    // Step by 2 in y, 4 in x for performance
+    for (let y = 0; y < overlap; y += 2) {
+      const r1 = (H1 - overlap + y) * W;
+      const r2 = y * W;
+      for (let x = 80; x < W - 80; x += 4) {
+        s1 += upper.ink[r1 + x];
+        s2 += lower.ink[r2 + x + dx];
+        count++;
+      }
+    }
+    const m1 = s1 / count;
+    const m2 = s2 / count;
+
+    let cov = 0, v1 = 0, v2 = 0;
+    for (let y = 0; y < overlap; y += 2) {
+      const r1 = (H1 - overlap + y) * W;
+      const r2 = y * W;
+      for (let x = 80; x < W - 80; x += 4) {
+        const d1 = upper.ink[r1 + x] - m1;
+        const d2 = lower.ink[r2 + x + dx] - m2;
+        cov += d1 * d2;
+        v1 += d1 * d1;
+        v2 += d2 * d2;
+      }
+    }
+    return (v1 > 100 && v2 > 100) ? cov / (Math.sqrt(v1) * Math.sqrt(v2)) : 0;
+  }
+
+  // Find best overlap for a directed pair (upper before lower)
+  function findBestOverlap(upper, lower) {
+    let bestZ = -1;
+    let bestOverlap = 0;
+    let bestDx = 0;
+
+    // Overlap search range: 40px to (H - 30px)
+    // Step by 3px for initial coarse search
+    for (let ov = 50; ov <= upper.validH - 40; ov += 3) {
+      const z = computeZNCC(upper, lower, ov, 0);
+      if (z > bestZ) {
+        bestZ = z;
+        bestOverlap = ov;
+      }
+    }
+
+    // Refine around bestOverlap with ±4px and dx in [-6, 6]
+    if (bestZ > 0.20) {
+      let refinedZ = bestZ;
+      let refinedOv = bestOverlap;
+      let refinedDx = 0;
+      for (let ov = Math.max(50, bestOverlap - 6); ov <= Math.min(upper.validH - 40, bestOverlap + 6); ov++) {
+        for (let dx = -6; dx <= 6; dx += 2) {
+          const z = computeZNCC(upper, lower, ov, dx);
+          if (z > refinedZ) {
+            refinedZ = z;
+            refinedOv = ov;
+            refinedDx = dx;
+          }
+        }
+      }
+      return { z: refinedZ, overlap: refinedOv, dx: refinedDx };
+    }
+
+    return { z: bestZ, overlap: bestOverlap, dx: 0 };
+  }
+
+  // Evaluate all ordered pairs
+  const allPairResults = [];
+  for (const a of names) {
+    for (const b of names) {
+      if (a === b) continue;
+      const res = findBestOverlap(images[a], images[b]);
+      allPairResults.push({
+        upper: a,
+        lower: b,
+        z: parseFloat(res.z.toFixed(4)),
+        overlap: res.overlap,
+        dx: res.dx
+      });
+    }
+  }
+
+  allPairResults.sort((x, y) => y.z - x.z);
+  await log('=== 2D ZNCC ALL PAIR SWEEP ===', allPairResults.slice(0, 20));
+
+  await fetch('/test-result', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ok: true, pairs: allPairResults })
+  });
+}
+run();
+</script>
+</body>
+</html>

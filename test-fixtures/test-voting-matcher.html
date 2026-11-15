@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const names = ['real_7', 'real_6', 'real_4', 'real_5', 'real_3', 'real_2', 'real_1'];
+  const loaded = {};
+
+  for (const name of names) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    const cropTop = 32, cropBottom = 32;
+    const validW = bmp.width;
+    const validH = bmp.height - cropTop - cropBottom;
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, cropTop, validW, validH, 0, 0, validW, validH);
+    const imgData = ctx.getImageData(0, 0, validW, validH);
+    const data = imgData.data;
+
+    const ink = new Float32Array(validW * validH);
+    const hProj = new Float32Array(validH);
+
+    for (let y = 0; y < validH; y++) {
+      let rowInk = 0;
+      const off = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (off + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 205) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[off + x] = val;
+        rowInk += val;
+      }
+      hProj[y] = rowInk / (validW - 120);
+    }
+
+    // Extract text line peaks
+    const candidatePeaks = [];
+    for (let y = 5; y < validH - 5; y++) {
+      if (hProj[y] > 10 && hProj[y] >= hProj[y-1] && hProj[y] >= hProj[y+1]) {
+        let isMax = true;
+        for (let dy = -3; dy <= 3; dy++) {
+          if (hProj[y + dy] > hProj[y]) { isMax = false; break; }
+        }
+        if (isMax) candidatePeaks.push({ y, val: hProj[y] });
+      }
+    }
+    candidatePeaks.sort((a, b) => b.val - a.val);
+    const lines = [];
+    for (const p of candidatePeaks) {
+      if (!lines.some(l => Math.abs(l.y - p.y) < 22)) lines.push(p);
+    }
+    lines.sort((a, b) => a.y - b.y);
+
+    // Compute normalized horizontal ink profile for each line
+    for (const line of lines) {
+      const prof = new Float32Array(validW);
+      const sy = Math.max(0, line.y - 8);
+      const ey = Math.min(validH - 1, line.y + 8);
+      for (let x = 60; x < validW - 60; x++) {
+        let sum = 0;
+        for (let y = sy; y <= ey; y++) {
+          sum += ink[y * validW + x];
+        }
+        prof[x] = sum;
+      }
+      let sum = 0, cnt = 0;
+      for (let x = 80; x < validW - 80; x++) {
+        sum += prof[x]; cnt++;
+      }
+      const mean = sum / cnt;
+      let varS = 0;
+      const norm = new Float32Array(validW);
+      for (let x = 80; x < validW - 80; x++) {
+        const v = prof[x] - mean;
+        norm[x] = v;
+        varS += v * v;
+      }
+      line.norm = norm;
+      line.std = Math.sqrt(varS);
+    }
+
+    loaded[name] = { id: name, validW, validH, ink, hProj, lines };
+  }
+
+  // Geometric line voting matcher
+  function matchPairByLineVoting(upper, lower) {
+    const W = upper.validW;
+    const H = upper.validH;
+    const votes = [];
+
+    for (let u = 0; u < upper.lines.length; u++) {
+      const lu = upper.lines[u];
+      if (lu.std < 15) continue;
+      for (let l = 0; l < lower.lines.length; l++) {
+        const ll = lower.lines[l];
+        if (ll.std < 15) continue;
+
+        // Try small horizontal shift [-14, 14]
+        let bestZ = -1, bestDx = 0;
+        for (let dx = -14; dx <= 14; dx += 2) {
+          let cov = 0;
+          for (let x = 95; x < W - 95; x++) {
+            cov += lu.norm[x] * ll.norm[x + dx];
+          }
+          const z = cov / (lu.std * ll.std);
+          if (z > bestZ) {
+            bestZ = z;
+            bestDx = dx;
+          }
+        }
+
+        if (bestZ >= 0.38) {
+          const dy = lu.y - ll.y;
+          if (dy >= 20 && dy <= H - 20) {
+            votes.push({ u, l, yu: lu.y, yl: ll.y, dy, dx: bestDx, z: bestZ });
+          }
+        } else if (upper.id === 'real_3' && lower.id === 'real_2' && bestZ > 0.20) {
+          log(`  real_3[${u}]@${lu.y} <-> real_2[${l}]@${ll.y}: bestZ=${bestZ.toFixed(3)}, dy=${lu.y - ll.y}, dx=${bestDx}`);
+        }
+      }
+    }
+
+    if (votes.length === 0) {
+      if (upper.id === 'real_3' && lower.id === 'real_2') {
+        log('DEBUG real_3 -> real_2: 0 votes found!');
+      }
+      return { score: 0, overlapH: 0, dx: 0, dy: 0, matchedLines: 0 };
+    }
+    if (upper.id === 'real_3' && lower.id === 'real_2') {
+      log('DEBUG real_3 -> real_2 votes:', votes);
+    }
+
+    // Cluster votes by dy (within ±10px)
+    const clusters = [];
+    for (const v of votes) {
+      let c = clusters.find(cl => Math.abs(cl.meanDy - v.dy) <= 10);
+      if (c) {
+        c.items.push(v);
+        c.meanDy = c.items.reduce((sum, item) => sum + item.dy, 0) / c.items.length;
+      } else {
+        clusters.push({ meanDy: v.dy, items: [v] });
+      }
+    }
+
+    // Rank clusters by (items.length * 1000 + sumZ)
+    clusters.sort((c1, c2) => {
+      const w1 = c1.items.length * 10 + c1.items.reduce((s, i) => s + i.z, 0);
+      const w2 = c2.items.length * 10 + c2.items.reduce((s, i) => s + i.z, 0);
+      return w2 - w1;
+    });
+
+    const bestCluster = clusters[0];
+    const avgZ = bestCluster.items.reduce((s, i) => s + i.z, 0) / bestCluster.items.length;
+    const avgDx = Math.round(bestCluster.items.reduce((s, i) => s + i.dx, 0) / bestCluster.items.length);
+    const bestDy = Math.round(bestCluster.meanDy);
+    const overlapH = H - bestDy;
+
+    // Single line match needs z >= 0.50 to avoid false positives
+    if (bestCluster.items.length === 1 && avgZ < 0.50) {
+      return { score: 0, overlapH: 0, dx: 0, dy: 0, matchedLines: 0 };
+    }
+
+    // Multi-line score
+    const score = Math.min(1.0, avgZ * 0.7 + Math.min(1.0, bestCluster.items.length / 3) * 0.3);
+
+    // Compute seamCut at the blank space valley
+    let seamCut = Math.floor(overlapH / 2);
+    let minInk = Infinity;
+    const startY = Math.max(5, Math.floor(overlapH * 0.15));
+    const endY = Math.min(overlapH - 5, Math.floor(overlapH * 0.85));
+    for (let y = startY; y <= endY; y++) {
+      const p1 = upper.hProj[H - overlapH + y];
+      const p2 = lower.hProj[y];
+      if (p1 + p2 < minInk) {
+        minInk = p1 + p2;
+        seamCut = y;
+      }
+    }
+
+    return {
+      score,
+      overlapH,
+      dx: avgDx,
+      dy: bestDy,
+      matchedLines: bestCluster.items.length,
+      avgZ,
+      seamCut,
+      items: bestCluster.items
+    };
+  }
+
+  const results = [];
+  for (const a of names) {
+    for (const b of names) {
+      if (a === b) continue;
+      const res = matchPairByLineVoting(loaded[a], loaded[b]);
+      if (res.score >= 0.35) {
+        results.push({
+          from: a,
+          to: b,
+          score: parseFloat(res.score.toFixed(3)),
+          overlapH: res.overlapH,
+          dy: res.dy,
+          dx: res.dx,
+          matchedLines: res.matchedLines,
+          avgZ: parseFloat(res.avgZ.toFixed(3)),
+          seamCut: res.seamCut
+        });
+      }
+    }
+  }
+
+  results.sort((x, y) => y.score - x.score);
+  await log('=== GEOMETRIC LINE VOTING MATCHES ===', results);
+
+  await fetch('/test-result', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ok: true, results })
+  });
+}
+run();
+</script>
+</body>
+</html>

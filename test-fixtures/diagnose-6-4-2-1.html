@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script type="module">
+import { extractCanvasFeatures } from '../src/core/canvasFallbackMatcher.ts';
+
+async function run() {
+  const [b6, b4, b2, b1] = await Promise.all([
+    fetch('/real-img/real_6.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_4.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_2.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_1.jpg').then(r => r.blob()).then(createImageBitmap)
+  ]);
+
+  const f6 = await extractCanvasFeatures(b6, 'real_6', 32, 32);
+  const f4 = await extractCanvasFeatures(b4, 'real_4', 32, 32);
+  const f2 = await extractCanvasFeatures(b2, 'real_2', 32, 32);
+  const f1 = await extractCanvasFeatures(b1, 'real_1', 32, 32);
+
+  // Inspect line peaks of f6 and f4
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      msg: 'f6 lines',
+      data: f6.lines.map(l => ({ y: l.y, val: Math.round(l.val), std: Math.round(l.std) }))
+    })
+  });
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      msg: 'f4 lines',
+      data: f4.lines.map(l => ({ y: l.y, val: Math.round(l.val), std: Math.round(l.std) }))
+    })
+  });
+
+  // Check all votes between f6 and f4
+  const votes64 = [];
+  for (let u = 0; u < f6.lines.length; u++) {
+    for (let l = 0; l < f4.lines.length; l++) {
+      const lu = f6.lines[u];
+      const ll = f4.lines[l];
+      let bestZ = -1, bestDx = 0;
+      for (let dx = -16; dx <= 16; dx += 2) {
+        let cov = 0;
+        for (let x = 140; x < f6.validW - 140; x++) {
+          cov += lu.norm[x] * ll.norm[x + dx];
+        }
+        const z = cov / (lu.std * ll.std);
+        if (z > bestZ) { bestZ = z; bestDx = dx; }
+      }
+      if (bestZ > 0.15) {
+        votes64.push({ u, l, yu: lu.y, yl: ll.y, dy: lu.y - ll.y, z: parseFloat(bestZ.toFixed(3)), dx: bestDx });
+      }
+    }
+  }
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg: 'votes 6->4', data: votes64 })
+  });
+
+  // Inspect line peaks of f2 and f1
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      msg: 'f2 lines',
+      data: f2.lines.map(l => ({ y: l.y, val: Math.round(l.val), std: Math.round(l.std) }))
+    })
+  });
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      msg: 'f1 lines',
+      data: f1.lines.map(l => ({ y: l.y, val: Math.round(l.val), std: Math.round(l.std) }))
+    })
+  });
+
+  // Check all z between f2 and f1
+  const allZ21 = [];
+  for (let u = 0; u < f2.lines.length; u++) {
+    for (let l = 0; l < f1.lines.length; l++) {
+      const lu = f2.lines[u];
+      const ll = f1.lines[l];
+      let bestZ = -1, bestDx = 0;
+      for (let dx = -16; dx <= 16; dx += 2) {
+        let cov = 0;
+        for (let x = 95; x < f2.validW - 95; x++) {
+          cov += lu.norm[x] * ll.norm[x + dx];
+        }
+        const z = cov / (lu.std * ll.std);
+        if (z > bestZ) { bestZ = z; bestDx = dx; }
+      }
+      allZ21.push({ u, l, yu: lu.y, yl: ll.y, z: parseFloat(bestZ.toFixed(3)), dx: bestDx });
+    }
+  }
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg: 'allZ 2->1', data: allZ21 })
+  });
+
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

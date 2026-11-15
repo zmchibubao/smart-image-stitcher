@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  async function loadImg(name) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    const validW = bmp.width;
+    const validH = bmp.height - 64; // crop 32 top, 32 bottom
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, 32, validW, validH, 0, 0, validW, validH);
+    const data = ctx.getImageData(0, 0, validW, validH).data;
+    const ink = new Float32Array(validW * validH);
+    for (let y = 0; y < validH; y++) {
+      const rowOffset = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (rowOffset + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 200) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[rowOffset + x] = val;
+      }
+    }
+    return { id: name, validW, validH, ink };
+  }
+
+  function computeZNCC(upper, lower, overlap, dx = 0) {
+    const W = upper.validW;
+    const H1 = upper.validH;
+    let s1 = 0, s2 = 0, count = 0;
+    for (let y = 0; y < overlap; y++) {
+      const r1 = (H1 - overlap + y) * W;
+      const r2 = y * W;
+      for (let x = 80; x < W - 80; x += 2) {
+        s1 += upper.ink[r1 + x];
+        s2 += lower.ink[r2 + x + dx];
+        count++;
+      }
+    }
+    const m1 = s1 / count;
+    const m2 = s2 / count;
+
+    let cov = 0, v1 = 0, v2 = 0;
+    for (let y = 0; y < overlap; y++) {
+      const r1 = (H1 - overlap + y) * W;
+      const r2 = y * W;
+      for (let x = 80; x < W - 80; x += 2) {
+        const d1 = upper.ink[r1 + x] - m1;
+        const d2 = lower.ink[r2 + x + dx] - m2;
+        cov += d1 * d2;
+        v1 += d1 * d1;
+        v2 += d2 * d2;
+      }
+    }
+    return (v1 > 100 && v2 > 100) ? cov / (Math.sqrt(v1) * Math.sqrt(v2)) : 0;
+  }
+
+  const r7 = await loadImg('real_7');
+  const r6 = await loadImg('real_6');
+  const r4 = await loadImg('real_4');
+  const r2 = await loadImg('real_2');
+  const r1 = await loadImg('real_1');
+
+  // Test r7 -> r6
+  let best76 = { z: -1, ov: 0, dx: 0 };
+  for (let ov = 20; ov < 550; ov++) {
+    for (let dx = -10; dx <= 10; dx += 2) {
+      const z = computeZNCC(r7, r6, ov, dx);
+      if (z > best76.z) best76 = { z, ov, dx };
+    }
+  }
+  await log('Best r7 -> r6:', best76);
+
+  // Test r6 -> r4
+  let best64 = { z: -1, ov: 0, dx: 0 };
+  for (let ov = 20; ov < 550; ov++) {
+    for (let dx = -10; dx <= 10; dx += 2) {
+      const z = computeZNCC(r6, r4, ov, dx);
+      if (z > best64.z) best64 = { z, ov, dx };
+    }
+  }
+  await log('Best r6 -> r4:', best64);
+
+  // Test r2 -> r1
+  let best21 = { z: -1, ov: 0, dx: 0 };
+  for (let ov = 20; ov < 550; ov++) {
+    for (let dx = -10; dx <= 10; dx += 2) {
+      const z = computeZNCC(r2, r1, ov, dx);
+      if (z > best21.z) best21 = { z, ov, dx };
+    }
+  }
+  await log('Best r2 -> r1:', best21);
+
+  await fetch('/test-result', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ok: true, best76, best64, best21 })
+  });
+}
+run();
+</script>
+</body>
+</html>

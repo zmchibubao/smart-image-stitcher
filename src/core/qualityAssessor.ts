@@ -5,11 +5,15 @@ export interface SeamQuality {
   lowerId: string
   upperName: string
   lowerName: string
+  direction: string
   overlapH: number
   dx: number
+  dy: number
   seamY: number
   matchScore: number
   alignmentConfidence: 'high' | 'medium' | 'low' | 'unknown'
+  contentDiff: number
+  decision: 'accepted' | 'fallback' | 'rejected'
   cutTextWarning: boolean
   status: 'perfect' | 'good' | 'needs-review' | 'disconnected'
   note?: string
@@ -69,23 +73,27 @@ export function assessStitchQuality(
     const lowImg = orderedImages[i + 1]
     const m = matchMap.get(`${upImg.id}→${lowImg.id}`)
 
-    if (!m || m.confidence === 'none' || m.score < 0.30) {
+    if (!m || m.confidence === 'none' || m.score < 0.24) {
       seamQualities.push({
         upperId: upImg.id,
         lowerId: lowImg.id,
         upperName: upImg.name,
         lowerName: lowImg.name,
+        direction: 'none',
         overlapH: 0,
         dx: 0,
+        dy: 0,
         seamY: 0,
         matchScore: 0,
         alignmentConfidence: 'unknown',
+        contentDiff: 1.0,
+        decision: 'fallback',
         cutTextWarning: false,
         status: 'disconnected',
         note: '未检测到明确的重叠内容，两图按物理边缘拼接，建议检查顺序',
       })
       warnings.push(`图片 ${upImg.name} 与 ${lowImg.name} 之间未检测到重叠特征`)
-      totalScoreSum += 40
+      totalScoreSum += 50
       continue
     }
 
@@ -120,13 +128,18 @@ export function assessStitchQuality(
       lowerId: lowImg.id,
       upperName: upImg.name,
       lowerName: lowImg.name,
+      direction: m.direction,
       overlapH,
       dx: m.offsetX,
+      dy: m.offsetY,
       seamY: m.seamCut || Math.floor(overlapH / 2),
       matchScore: matchScorePct,
       alignmentConfidence: m.confidence,
+      contentDiff: m.contentDiff !== undefined ? m.contentDiff : Math.max(0, 1 - m.score),
+      decision: 'accepted',
       cutTextWarning,
       status,
+      note: m.matchedLinesCount ? `锚定匹配 ${m.matchedLinesCount} 行文本特征` : undefined,
     })
   }
 

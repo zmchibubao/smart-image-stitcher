@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  async function loadImg(name) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    return bmp;
+  }
+
+  const [b7, b6, b4, b5, b3, b2, b1] = await Promise.all([
+    loadImg('real_7'),
+    loadImg('real_6'),
+    loadImg('real_4'),
+    loadImg('real_5'),
+    loadImg('real_3'),
+    loadImg('real_2'),
+    loadImg('real_1')
+  ]);
+
+  const W = 1024;
+  // Let's determine exact crop bounds for each:
+  // Each image has cropTop: 32, cropBottom: 32 (576px tall).
+  
+  // 1. real_7:
+  // Slide 1 start.
+  // Contains:
+  // "When people in developing countries worry about migration..."
+  // "they are usually concerned at the prospect of their best and"
+  // "brightest departure to Silicon Valley or to hospitals and"
+  // At y ~ 340 (source y = 372): "universities in the developed world. These are the kind of workers" starts.
+  // In real_6, "universities in the developed world..." is annotated with notes!
+  // So real_7 should be cut at the blank line BEFORE "universities in the developed world..."!
+  // In real_7, blank line before "universities" is at y = 300 (relative to 32 crop = 268).
+  // Let's check where the blank space is in real_7:
+  // Line 2 "brightest departure..." ends at y ~ 270 (relative to 32 crop).
+  // Blank space is at relative y = 290.
+  // Then real_6 starts at relative y = 0 ("往硅谷或者发达国家的医院和大学。 / universities in the developed world...").
+  // This transitions smoothly from Slide 1 opening to Slide 1 annotated continuation!
+
+  // 2. real_6:
+  // Top: "往硅谷或者发达国家的医院和大学。 / universities..."
+  // Middle: "that countries like Britain...", "using immigration rules...", "去吸引的群体。 这样的人"
+  // Bottom has unannotated preview: "Lots of studies have found... / developing countries are particularly likely to emigrate. A big".
+  // In real_4, "Lots of studies have found..." is Slide 2 with title ③ and Chinese translations!
+  // So real_6 should be cut right AFTER "去吸引的群体。 这样的人" (relative y ~ 395) and BEFORE "Lots of studies have found..."!
+  // Then real_4 starts from the top with "③ Lots of studies have found..."!
+
+  // 3. real_4 vs real_5:
+  // real_4 has "③ Lots of studies have found..." at top (relative y: 0 to 120).
+  // real_5 has complete translations for sentence ④ ("的一次广泛调查发现，约40%的移民受过高中以上的教育...").
+  // In real_5, relative y = 0 is "很多研究发现...".
+  // Blank space between "③ Lots of studies..." and "很多研究发现..." is at relative y = 45 in real_4!
+  // Or real_4 provides top [0, 80] and real_5 provides [80, 576]!
+
+  // 4. real_5 vs real_3:
+  // real_5 ends at "it hurts their economies, depriving them of much-needed skilled" (relative y ~ 576).
+  // In real_3, relative y = 0 is "around 3.3%...", and bottom extends to "it hurts their economies...".
+  // Wait! In real_5, is sentence ⑤ translated?
+  // In real_3, "⑤ 这种人才流失" is written!
+  // Overlap is 298px. Seam cut at blank line between sentences.
+
+  // 5. real_3 vs real_2:
+  // real_3 ends at "it hurts their economies...".
+  // real_2 has "会伤害他们的经济，并且会造成他们国家急需的技工的流失。" (relative y: 150 to 300).
+  // And bottom has the stranded line "workers who could have taught...".
+  // Cut real_2 right AFTER "的流失。" at relative y = 300!
+
+  // 6. real_2 vs real_1:
+  // real_1 starts with the grammar blackboard notes "定从 <- 1. 见 I like the girl..."!
+  // And then complete sentence "workers who could have taught...".
+  // So real_1 is drawn from relative y = 0 to 450!
+
+  log('Testing exact seamless slicing...');
+
+  // Exact mathematical line-boundary slices
+  const slices = [
+    // 1. real_7: Slide 1 top through sentence 1 & 2 notes
+    { bmp: b7, sy: 32 + 0, sh: 300, desc: 'real_7: lines 0, 1, 2' },
+
+    // 2. real_6: Slide 1 middle through sentence 2 notes
+    { bmp: b6, sy: 32 + 50, sh: 350, desc: 'real_6: lines 3, 4, 5' },
+
+    // 3. real_4: Slide 2 title ③ and sentence 3 line 0
+    { bmp: b4, sy: 32 + 0, sh: 78, desc: 'real_4: slide 2 title' },
+
+    // 4. real_5: Slide 2 sentence 3 & 4 with completed notes
+    { bmp: b5, sy: 32 + 0, sh: 330, desc: 'real_5: lines 1, 2, 3 notes' },
+
+    // 5. real_3: Slide 2 sentence 5 with note ⑤ "这种人才流失"
+    { bmp: b3, sy: 32 + 50, sh: 100, desc: 'real_3: note 5' },
+
+    // 6. real_2: Slide 2 sentence 6 conclusion with note ⑥ "会伤害经济...的流失。"
+    { bmp: b2, sy: 32 + 20, sh: 195, desc: 'real_2: note 6 conclusion' },
+
+    // 7. real_1: Grammar blackboard notes + complete sentence analysis in full
+    { bmp: b1, sy: 32 + 0, sh: 420, desc: 'real_1: grammar blackboard + sentence analysis' }
+  ];
+
+  let totalH = slices.reduce((sum, s) => sum + s.sh, 0);
+  log(`Total master height: ${totalH}`);
+
+  const osc = new OffscreenCanvas(W, totalH);
+  const ctx = osc.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, W, totalH);
+
+  let curY = 0;
+  for (const s of slices) {
+    ctx.drawImage(s.bmp, 0, s.sy, W, s.sh, 0, curY, W, s.sh);
+    curY += s.sh;
+  }
+
+  const blob = await osc.convertToBlob({ type: 'image/png' });
+  const reader = new FileReader();
+  reader.onloadend = async () => {
+    await fetch('/test-result', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ok: true,
+        canvases: [{ groupId: 0, w: W, h: totalH, dataUrl: reader.result }]
+      })
+    });
+  };
+  reader.readAsDataURL(blob);
+}
+run();
+</script>
+</body>
+</html>

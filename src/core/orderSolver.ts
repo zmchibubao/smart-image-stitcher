@@ -29,7 +29,7 @@ export function solveOrder(
   // 1. 整理所有候选有向边
   const edges: DirectedEdge[] = []
   for (const match of matches) {
-    if (match.score < 0.38 || match.confidence === 'none') continue
+    if (match.score < 0.24 || match.confidence === 'none') continue
     if (!idSet.has(match.imageIdA) || !idSet.has(match.imageIdB)) continue
 
     if (match.direction === 'A_before_B') {
@@ -99,12 +99,11 @@ export function solveOrder(
       path: string[],
       score: number
     ) {
-      if (
-        path.length > bestChain.length ||
-        (path.length === bestChain.length && score > bestScore)
-      ) {
+      // 综合路径质量评估：总有效置信度 + 连续链接奖励（优先连接高置信度相邻图，避免低置信度绕路乱入）
+      const pathQuality = score + (path.length - 1) * 0.35
+      if (pathQuality > bestScore) {
         bestChain = [...path]
-        bestScore = score
+        bestScore = pathQuality
       }
 
       const neighbors = adj.get(currId) || []

@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<div id="status">Testing Line Anchor Matcher...</div>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+// Extract text lines from image
+function extractTextLines(bmp, id, cropTop = 32, cropBottom = 32) {
+  const W = bmp.width;
+  const H = bmp.height - cropTop - cropBottom;
+
+  const osc = new OffscreenCanvas(W, H);
+  const ctx = osc.getContext('2d');
+  ctx.drawImage(bmp, 0, cropTop, W, H, 0, 0, W, H);
+  const data = ctx.getImageData(0, 0, W, H).data;
+
+  // 1. Row ink profile
+  const rawHProj = new Float32Array(H);
+  for (let y = 0; y < H; y++) {
+    let rowInk = 0;
+    const offset = y * W;
+    for (let x = 60; x < W - 60; x++) {
+      const idx = (offset + x) * 4;
+      const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+      const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+      let val = 0;
+      if (avg < 200) val = 255 - avg;
+      else if (diff > 25) val = diff * 1.5;
+      if (val > 20) rowInk += val;
+    }
+    rawHProj[y] = rowInk / (W - 120);
+  }
+
+  // Smooth hProj (Gaussian 1D radius 2)
+  const hProj = new Float32Array(H);
+  for (let y = 0; y < H; y++) {
+    let sum = 0, weight = 0;
+    for (let dy = -3; dy <= 3; dy++) {
+      const yy = y + dy;
+      if (yy >= 0 && yy < H) {
+        const w = Math.exp(-(dy * dy) / (2 * 1.5 * 1.5));
+        sum += rawHProj[yy] * w;
+        weight += w;
+      }
+    }
+    hProj[y] = sum / weight;
+  }
+
+  // 2. Identify text lines by finding prominent local peaks
+  const candidatePeaks = [];
+  for (let y = 5; y < H - 5; y++) {
+    if (hProj[y] > 8 && hProj[y] >= hProj[y-1] && hProj[y] >= hProj[y+1]) {
+      // Check if it's the strict max in [y-3, y+3]
+      let isMax = true;
+      for (let dy = -3; dy <= 3; dy++) {
+        if (hProj[y + dy] > hProj[y]) {
+          isMax = false;
+          break;
+        }
+      }
+      if (isMax) {
+        candidatePeaks.push({ y, val: hProj[y] });
+      }
+    }
+  }
+
+  // Non-maximum suppression along y: ensure peaks are separated by at least 25px
+  candidatePeaks.sort((a, b) => b.val - a.val);
+  const selectedPeaks = [];
+  for (const p of candidatePeaks) {
+    if (!selectedPeaks.some(sp => Math.abs(sp.y - p.y) < 25)) {
+      selectedPeaks.push(p);
+    }
+  }
+  selectedPeaks.sort((a, b) => a.y - b.y);
+
+  const lines = selectedPeaks.map(p => ({
+    peakY: p.y,
+    val: p.val
+  }));
+
+  // 3. Extract centered horizontal profile for each line
+  for (const line of lines) {
+    const prof = new Float32Array(W);
+    const startY = Math.max(0, line.peakY - 6);
+    const endY = Math.min(H - 1, line.peakY + 6);
+    for (let x = 60; x < W - 60; x++) {
+      let colSum = 0;
+      for (let y = startY; y <= endY; y++) {
+        const idx = (y * W + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 200) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        colSum += val;
+      }
+      prof[x] = colSum;
+    }
+
+    let sum = 0, cnt = 0;
+    for (let x = 80; x < W - 80; x++) {
+      sum += prof[x];
+      cnt++;
+    }
+    const mean = sum / cnt;
+    let varS = 0;
+    const norm = new Float32Array(W);
+    for (let x = 80; x < W - 80; x++) {
+      const v = prof[x] - mean;
+      norm[x] = v;
+      varS += v * v;
+    }
+    line.norm = norm;
+    line.std = Math.sqrt(varS);
+  }
+
+  return { id, W, H, hProj, lines };
+}
+
+function matchLinePair(lineA, lineB) {
+  if (lineA.std < 10 || lineB.std < 10) return { zncc: 0, dx: 0 };
+  let bestZ = -1, bestDx = 0;
+  const W = lineA.norm.length;
+
+  for (let dx = -10; dx <= 10; dx++) {
+    let cov = 0;
+    for (let x = 90; x < W - 90; x++) {
+      cov += lineA.norm[x] * lineB.norm[x + dx];
+    }
+    const z = cov / (lineA.std * lineB.std);
+    if (z > bestZ) {
+      bestZ = z;
+      bestDx = dx;
+    }
+  }
+  return { zncc: bestZ, dx: bestDx };
+}
+
+// Test if Upper is placed before Lower
+function evaluateDirectedMatch(upper, lower) {
+  const matches = [];
+
+  for (let u = 0; u < upper.lines.length; u++) {
+    for (let l = 0; l < lower.lines.length; l++) {
+      const la = upper.lines[u];
+      const lb = lower.lines[l];
+      const res = matchLinePair(la, lb);
+
+      // High confidence text line match
+      if (res.zncc >= 0.40) {
+        const dy = la.peakY - lb.peakY;
+        // Direction sanity check:
+        // If upper is before lower:
+        // la is in upper (towards bottom, y >= 50)
+        // lb is in lower (towards top, y <= H - 50)
+        // dy = la.peakY - lb.peakY > 0!
+        if (dy >= -20) {
+          matches.push({
+            u,
+            l,
+            peakU: la.peakY,
+            peakL: lb.peakY,
+            dy,
+            dx: res.dx,
+            zncc: res.zncc
+          });
+        }
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return { score: 0, overlapH: 0, dx: 0, dy: 0, matchedLines: 0 };
+  }
+
+  // Cluster by dy (within ±6px)
+  const clusters = new Map();
+  for (const m of matches) {
+    let keyFound = null;
+    for (const k of clusters.keys()) {
+      if (Math.abs(m.dy - k) <= 6) {
+        keyFound = k;
+        break;
+      }
+    }
+    if (keyFound !== null) {
+      clusters.get(keyFound).push(m);
+    } else {
+      clusters.set(m.dy, [m]);
+    }
+  }
+
+  let bestCluster = [];
+  let bestDy = 0;
+  for (const [dy, list] of clusters.entries()) {
+    if (list.length > bestCluster.length) {
+      bestCluster = list;
+      bestDy = dy;
+    } else if (list.length === bestCluster.length) {
+      const sumZ1 = list.reduce((a, b) => a + b.zncc, 0);
+      const sumZ2 = bestCluster.reduce((a, b) => a + b.zncc, 0);
+      if (sumZ1 > sumZ2) {
+        bestCluster = list;
+        bestDy = dy;
+      }
+    }
+  }
+
+  let sumDx = 0, sumZ = 0;
+  for (const m of bestCluster) {
+    sumDx += m.dx;
+    sumZ += m.zncc;
+  }
+  const avgDx = Math.round(sumDx / bestCluster.length);
+  const avgZ = sumZ / bestCluster.length;
+
+  const overlapH = upper.H - bestDy;
+  // If overlap is negative or exceeds 95% of screen (unless incremental snapshot), reject
+  if (overlapH <= 20 || overlapH > upper.H * 0.98) {
+    return { score: 0, overlapH: 0, dx: 0, dy: 0, matchedLines: 0 };
+  }
+
+  // Calculate score based on matched lines and avgZ
+  const score = Math.min(1.0, (avgZ * 0.7 + Math.min(1.0, bestCluster.length / 3) * 0.3));
+
+  return {
+    score,
+    overlapH,
+    dx: avgDx,
+    dy: bestDy,
+    matchedLines: bestCluster.length,
+    avgZ,
+    cluster: bestCluster
+  };
+}
+
+async function run() {
+  const names = ['real_7', 'real_6', 'real_4', 'real_5', 'real_3', 'real_2', 'real_1'];
+  const images = {};
+
+  for (const n of names) {
+    const res = await fetch('/real-img/' + n + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    images[n] = extractTextLines(bmp, n, 32, 32);
+    log(`Image ${n}: ${images[n].lines.length} lines: ` + images[n].lines.map(l => `peak=${l.peakY},h=${l.height},std=${Math.round(l.std)}`).join(' | '));
+  }
+
+  // also explicitly debug pairs: 7->6, 6->4, 3->2
+  for (const [pa, pb] of [['real_7', 'real_6'], ['real_6', 'real_4'], ['real_3', 'real_2'], ['real_2', 'real_1']]) {
+    const la = images[pa];
+    const lb = images[pb];
+    for (let u = 0; u < la.lines.length; u++) {
+      for (let l = 0; l < lb.lines.length; l++) {
+        const res = matchLinePair(la.lines[u], lb.lines[l]);
+        if (res.zncc > 0.20) {
+          log(`  DEBUG ${pa}[${u}]@${la.lines[u].peakY} <-> ${pb}[${l}]@${lb.lines[l].peakY}: zncc=${res.zncc.toFixed(3)}, dx=${res.dx}, dy=${la.lines[u].peakY - lb.lines[l].peakY}`);
+        }
+      }
+    }
+  }
+  for (const a of names) {
+    for (const b of names) {
+      if (a === b) continue;
+      const res = evaluateDirectedMatch(images[a], images[b]);
+      if (res.score >= 0.35) {
+        results.push({
+          from: a,
+          to: b,
+          score: parseFloat(res.score.toFixed(3)),
+          overlapH: res.overlapH,
+          dx: res.dx,
+          dy: res.dy,
+          matchedLines: res.matchedLines,
+          avgZ: parseFloat(res.avgZ.toFixed(3)),
+          lines: res.cluster.map(c => `U[${c.u}]@${c.peakU} <-> L[${c.l}]@${c.peakL} (z=${c.zncc.toFixed(2)})`)
+        });
+      }
+    }
+  }
+
+  results.sort((x, y) => y.score - x.score);
+  await log('=== DIRECTED LINE ANCHOR MATCHES ===', results);
+
+  await fetch('/test-result', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ok: true, results })
+  });
+}
+run();
+</script>
+</body>
+</html>

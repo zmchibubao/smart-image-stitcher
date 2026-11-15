@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const names = ['real_7', 'real_6', 'real_5', 'real_4', 'real_3', 'real_2', 'real_1'];
+  const images = {};
+
+  for (const name of names) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+
+    const validW = bmp.width;
+    const validH = bmp.height - 64;
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, 32, validW, validH, 0, 0, validW, validH);
+    const data = ctx.getImageData(0, 0, validW, validH).data;
+
+    // Ink matrix
+    const ink = new Float32Array(validW * validH);
+    const hProj = new Float32Array(validH);
+
+    for (let y = 0; y < validH; y++) {
+      let rowInk = 0;
+      const rowOffset = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (rowOffset + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 200) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[rowOffset + x] = val;
+        rowInk += val;
+      }
+      hProj[y] = rowInk / (validW - 120);
+    }
+
+    images[name] = { id: name, validW, validH, ink, hProj };
+  }
+
+  // ZNCC function for two rows/bands along x
+  function computeLineZNCC(upper, lower, yUpper, yLower, dx = 0) {
+    const W = upper.validW;
+    const count = W - 160;
+    let s1 = 0, s2 = 0;
+    for (let x = 80; x < W - 80; x++) {
+      s1 += upper.ink[yUpper * W + x];
+      s2 += lower.ink[yLower * W + x + dx];
+    }
+    const m1 = s1 / count;
+    const m2 = s2 / count;
+
+    let cov = 0, v1 = 0, v2 = 0;
+    for (let x = 80; x < W - 80; x++) {
+      const d1 = upper.ink[yUpper * W + x] - m1;
+      const d2 = lower.ink[yLower * W + x + dx] - m2;
+      cov += d1 * d2;
+      v1 += d1 * d1;
+      v2 += d2 * d2;
+    }
+    return (v1 > 50 && v2 > 50) ? cov / (Math.sqrt(v1) * Math.sqrt(v2)) : 0;
+  }
+
+  // Evaluate candidate overlap between upper and lower
+  function testOverlap(upper, lower, overlap, dx = 0) {
+    const H1 = upper.validH;
+    let totalZ = 0;
+    let testedLines = 0;
+    let highMatchCount = 0;
+
+    for (let y = 10; y < overlap - 10; y += 4) {
+      const p1 = upper.hProj[H1 - overlap + y];
+      const p2 = lower.hProj[y];
+      // Only test rows where both have text ink
+      if (p1 > 15 && p2 > 15) {
+        const zncc = computeLineZNCC(upper, lower, H1 - overlap + y, y, dx);
+        totalZ += zncc;
+        testedLines++;
+        if (zncc > 0.30) highMatchCount++;
+      }
+    }
+
+    const avgZ = testedLines > 0 ? totalZ / testedLines : 0;
+    return { avgZ, testedLines, highMatchCount };
+  }
+
+  // Test ground truth pairs and false pairs
+  const testPairs = [
+    // True pairs
+    { u: 'real_7', l: 'real_6', ov: 390, dx: 0, expect: 'TRUE' },
+    { u: 'real_6', l: 'real_5', ov: 205, dx: 0, expect: 'TRUE' },
+    { u: 'real_5', l: 'real_3', ov: 298, dx: 0, expect: 'TRUE' },
+    { u: 'real_3', l: 'real_2', ov: 448, dx: 0, expect: 'TRUE' },
+    { u: 'real_2', l: 'real_1', ov: 243, dx: 0, expect: 'TRUE' },
+    // False pairs (bogus connections that previously tricked the matcher)
+    { u: 'real_1', l: 'real_3', ov: 474, dx: 0, expect: 'FALSE' },
+    { u: 'real_1', l: 'real_7', ov: 433, dx: 0, expect: 'FALSE' },
+    { u: 'real_1', l: 'real_4', ov: 460, dx: 0, expect: 'FALSE' },
+    { u: 'real_1', l: 'real_2', ov: 443, dx: 0, expect: 'FALSE' },
+    { u: 'real_7', l: 'real_2', ov: 488, dx: 0, expect: 'FALSE' },
+    { u: 'real_6', l: 'real_2', ov: 451, dx: 0, expect: 'FALSE' },
+    { u: 'real_7', l: 'real_3', ov: 391, dx: 0, expect: 'FALSE' },
+  ];
+
+  for (const tp of testPairs) {
+    const res = testOverlap(images[tp.u], images[tp.l], tp.ov, tp.dx);
+    log(`Test [${tp.expect}] ${tp.u} -> ${tp.l} (ov=${tp.ov}):`, res);
+  }
+
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

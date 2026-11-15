@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function inspectImages(idA, idB) {
+  const [bA, bB] = await Promise.all([
+    fetch('/real-img/' + idA + '.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/' + idB + '.jpg').then(r => r.blob()).then(createImageBitmap)
+  ]);
+
+  function getLines(bmp) {
+    const validW = bmp.width;
+    const validH = bmp.height - 64;
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, 32, validW, validH, 0, 0, validW, validH);
+    const data = ctx.getImageData(0, 0, validW, validH).data;
+
+    const hProj = new Float32Array(validH);
+    for (let y = 0; y < validH; y++) {
+      let count = 0;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (y * validW + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        if (avg < 200) count++;
+      }
+      hProj[y] = count;
+    }
+
+    // Line peaks
+    const peaks = [];
+    for (let y = 5; y < validH - 5; y++) {
+      if (hProj[y] > 100 && hProj[y] >= hProj[y-1] && hProj[y] >= hProj[y+1]) {
+        if (peaks.length === 0 || y - peaks[peaks.length-1].y > 18) {
+          peaks.push({ y, count: hProj[y] });
+        }
+      }
+    }
+    return { validW, validH, peaks, hProj };
+  }
+
+  const resA = getLines(bA);
+  const resB = getLines(bB);
+
+  await log(`PEAKS in ${idA}:`, resA.peaks);
+  await log(`PEAKS in ${idB}:`, resB.peaks);
+}
+
+async function run() {
+  await inspectImages('real_7', 'real_6');
+  await inspectImages('real_6', 'real_4');
+  await inspectImages('real_4', 'real_5');
+  await inspectImages('real_5', 'real_3');
+  await inspectImages('real_3', 'real_2');
+  await inspectImages('real_2', 'real_1');
+
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  async function loadImg(name) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    const validW = bmp.width;
+    const validH = bmp.height - 64;
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, 32, validW, validH, 0, 0, validW, validH);
+    const data = ctx.getImageData(0, 0, validW, validH).data;
+    const ink = new Float32Array(validW * validH);
+    const hProj = new Float32Array(validH);
+    for (let y = 0; y < validH; y++) {
+      let rSum = 0;
+      const off = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (off + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 205) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[off + x] = val;
+        rSum += val;
+      }
+      hProj[y] = rSum / (validW - 120);
+    }
+    return { id: name, validW, validH, ink, hProj };
+  }
+
+  const [r7, r6, r4, r5, r3, r2, r1] = await Promise.all([
+    loadImg('real_7'), loadImg('real_6'), loadImg('real_4'), loadImg('real_5'), loadImg('real_3'), loadImg('real_2'), loadImg('real_1')
+  ]);
+
+  function evalInkRowsZNCC(upper, lower, overlap, dx = 0) {
+    const W = upper.validW;
+    const H = upper.validH;
+    let s1 = 0, s2 = 0, count = 0;
+    for (let y = 0; y < overlap; y += 2) {
+      const yu = H - overlap + y;
+      const yl = y;
+      // Only include rows where at least one has significant ink
+      if (upper.hProj[yu] < 6 && lower.hProj[yl] < 6) continue;
+      const r1 = yu * W;
+      const r2 = yl * W;
+      for (let x = 80; x < W - 80; x += 4) {
+        s1 += upper.ink[r1 + x];
+        s2 += lower.ink[r2 + x + dx];
+        count++;
+      }
+    }
+    if (count < 50) return 0;
+    const m1 = s1 / count;
+    const m2 = s2 / count;
+
+    let cov = 0, v1 = 0, v2 = 0;
+    for (let y = 0; y < overlap; y += 2) {
+      const yu = H - overlap + y;
+      const yl = y;
+      if (upper.hProj[yu] < 6 && lower.hProj[yl] < 6) continue;
+      const r1 = yu * W;
+      const r2 = yl * W;
+      for (let x = 80; x < W - 80; x += 4) {
+        const d1 = upper.ink[r1 + x] - m1;
+        const d2 = lower.ink[r2 + x + dx] - m2;
+        cov += d1 * d2;
+        v1 += d1 * d1;
+        v2 += d2 * d2;
+      }
+    }
+    return (v1 > 100 && v2 > 100) ? cov / (Math.sqrt(v1) * Math.sqrt(v2)) : 0;
+  }
+
+  const testPairs = [
+    { u: r7, l: r6, ov: 334, dx: 10, label: '7 -> 6 (TRUE)' },
+    { u: r6, l: r4, ov: 99, dx: 8, label: '6 -> 4 (TRUE)' },
+    { u: r4, l: r5, ov: 496, dx: 0, label: '4 -> 5 (TRUE)' },
+    { u: r5, l: r3, ov: 298, dx: 0, label: '5 -> 3 (TRUE)' },
+    { u: r3, l: r2, ov: 448, dx: -6, label: '3 -> 2 (TRUE)' },
+    { u: r2, l: r1, ov: 243, dx: 0, label: '2 -> 1 (TRUE, ov=243, dy=333)' },
+    // False pairs
+    { u: r6, l: r1, ov: 277, dx: -9, label: '6 -> 1 (FALSE)' },
+    { u: r1, l: r4, ov: 461, dx: -2, label: '1 -> 4 (FALSE)' },
+    { u: r7, l: r1, ov: 469, dx: 2, label: '7 -> 1 (FALSE)' },
+    { u: r5, l: r7, ov: 443, dx: 0, label: '5 -> 7 (FALSE)' }
+  ];
+
+  // Detailed scan of 7 -> 6 and 6 -> 7
+  let peak76 = [];
+  for (let ov = 30; ov < 550; ov += 2) {
+    for (let dx = -12; dx <= 12; dx += 2) {
+      const z = evalInkRowsZNCC(r7, r6, ov, dx);
+      if (z > 0.22) peak76.push({ dir: '7->6', ov, dx, z: parseFloat(z.toFixed(4)) });
+    }
+  }
+  peak76.sort((a, b) => b.z - a.z);
+  log('Top 7->6 peaks:', peak76.slice(0, 5));
+
+  let peak67 = [];
+  for (let ov = 30; ov < 550; ov += 2) {
+    for (let dx = -12; dx <= 12; dx += 2) {
+      const z = evalInkRowsZNCC(r6, r7, ov, dx);
+      if (z > 0.22) peak67.push({ dir: '6->7', ov, dx, z: parseFloat(z.toFixed(4)) });
+    }
+  }
+  peak67.sort((a, b) => b.z - a.z);
+  log('Top 6->7 peaks:', peak67.slice(0, 5));
+
+  for (const tp of testPairs) {
+    const z = evalInkRowsZNCC(tp.u, tp.l, tp.ov, tp.dx);
+    log(`ZNCC on ink rows [${tp.label}]:`, { z: parseFloat(z.toFixed(4)) });
+  }
+
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

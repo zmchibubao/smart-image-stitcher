@@ -117,10 +117,14 @@ const canvasSize = computed(() => {
             <span class="seam-status-badge">{{ s.status === 'perfect' ? '✅ 完美对齐' : s.status === 'good' ? '✨ 良好无缝' : '⚠️ 需检查' }}</span>
           </div>
           <div class="seam-body">
+            <span>排列方向: <strong>{{ s.direction }}</strong></span>
             <span>重叠高度: <strong>{{ s.overlapH }}px</strong></span>
-            <span>水平偏移: <strong>{{ s.dx }}px</strong></span>
+            <span>水平偏移 dx: <strong>{{ s.dx }}px</strong></span>
+            <span>垂直偏移 dy: <strong>{{ s.dy }}px</strong></span>
             <span>无损接缝行: <strong>第 {{ s.seamY }} 行 (空白谷底)</strong></span>
+            <span>内容差异度: <strong>{{ (s.contentDiff * 100).toFixed(1) }}%</strong></span>
             <span>匹配置信度: <strong>{{ s.matchScore }}% ({{ s.alignmentConfidence }})</strong></span>
+            <span>最终判定: <strong>{{ s.decision === 'accepted' ? '接受对齐' : '边缘回退' }}</strong></span>
           </div>
           <div v-if="s.note" class="seam-note">{{ s.note }}</div>
         </div>

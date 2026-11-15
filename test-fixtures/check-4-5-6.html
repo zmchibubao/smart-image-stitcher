@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const [b6, b5, b4] = await Promise.all([
+    fetch('/real-img/real_6.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_5.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_4.jpg').then(r => r.blob()).then(createImageBitmap)
+  ]);
+
+  // Let's inspect real_4 vs real_5 vs real_6
+  // Print canvas heights and draw the top 200px of real_4, real_5, and bottom 200px of real_6
+  log('Sizes:', { b6: `${b6.width}x${b6.height}`, b5: `${b5.width}x${b5.height}`, b4: `${b4.width}x${b4.height}` });
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

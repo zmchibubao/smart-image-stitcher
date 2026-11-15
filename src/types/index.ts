@@ -57,6 +57,9 @@ export interface MatchResult {
   direction: 'A_before_B' | 'B_before_A' | 'unknown'
   inlierCount: number
   seamCut?: number
+  contentDiff?: number
+  matchedLinesCount?: number
+  decision?: 'accepted' | 'rejected' | 'candidate'
 }
 
 export interface StitchGroup {

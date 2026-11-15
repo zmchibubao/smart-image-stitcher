@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const [b4, b5, b7, b6] = await Promise.all([
+    fetch('/real-img/real_4.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_5.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_7.jpg').then(r => r.blob()).then(createImageBitmap),
+    fetch('/real-img/real_6.jpg').then(r => r.blob()).then(createImageBitmap)
+  ]);
+
+  // Let's inspect real_7 line Ys:
+  // We want to know where "universities in the developed world" starts in real_7 and real_6
+  // And where "Lots of studies have found..." starts in real_4 and real_5
+  
+  function getInkProfile(bmp, cropTop = 32, cropBottom = 32) {
+    const W = bmp.width;
+    const H = bmp.height - cropTop - cropBottom;
+    const osc = new OffscreenCanvas(W, H);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, cropTop, W, H, 0, 0, W, H);
+    const data = ctx.getImageData(0, 0, W, H).data;
+    const prof = new Float32Array(H);
+    for (let y = 0; y < H; y++) {
+      let sum = 0;
+      const off = y * W * 4;
+      for (let x = 80; x < W - 80; x++) {
+        const avg = (data[off + x*4] + data[off + x*4 + 1] + data[off + x*4 + 2]) / 3;
+        if (avg < 200) sum += (255 - avg);
+      }
+      prof[y] = sum;
+    }
+    return prof;
+  }
+
+  log('Profiling b7, b6, b4, b5...');
+  await fetch('/test-result', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ ok: true }) });
+}
+run();
+</script>
+</body>
+</html>

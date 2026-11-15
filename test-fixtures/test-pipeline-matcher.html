@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script type="module">
+async function log(msg, data) {
+  await fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+async function run() {
+  const names = ['real_7', 'real_6', 'real_4', 'real_5', 'real_3', 'real_2', 'real_1'];
+  const loaded = {};
+
+  for (const name of names) {
+    const res = await fetch('/real-img/' + name + '.jpg');
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    const cropTop = 32, cropBottom = 32;
+    const validW = bmp.width;
+    const validH = bmp.height - cropTop - cropBottom;
+    const osc = new OffscreenCanvas(validW, validH);
+    const ctx = osc.getContext('2d');
+    ctx.drawImage(bmp, 0, cropTop, validW, validH, 0, 0, validW, validH);
+    const imgData = ctx.getImageData(0, 0, validW, validH);
+    const data = imgData.data;
+
+    const ink = new Float32Array(validW * validH);
+    const hProj = new Float32Array(validH);
+
+    for (let y = 0; y < validH; y++) {
+      let rowInk = 0;
+      const off = y * validW;
+      for (let x = 60; x < validW - 60; x++) {
+        const idx = (off + x) * 4;
+        const avg = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+        const diff = Math.max(data[idx], data[idx+1], data[idx+2]) - Math.min(data[idx], data[idx+1], data[idx+2]);
+        let val = 0;
+        if (avg < 205) val = 255 - avg;
+        else if (diff > 25) val = diff * 1.5;
+        ink[off + x] = val;
+        rowInk += val;
+      }
+      hProj[y] = rowInk / (validW - 120);
+    }
+    loaded[name] = { id: name, validW, validH, ink, hProj };
+  }
+
+  // Extract prominent line fingerprints for each image
+  for (const name of names) {
+    const item = loaded[name];
+    const lines = [];
+    for (let y = 10; y < item.validH - 10; y++) {
+      if (item.hProj[y] > 12 && item.hProj[y] >= item.hProj[y-1] && item.hProj[y] >= item.hProj[y+1]) {
+        // Must be local max in ±4
+        let isMax = true;
+        for (let dy = -4; dy <= 4; dy++) {
+          if (item.hProj[y + dy] > item.hProj[y]) { isMax = false; break; }
+        }
+        if (isMax) {
+          lines.push({ y, val: item.hProj[y] });
+        }
+      }
+    }
+    // Filter lines separated by at least 22px
+    lines.sort((a, b) => b.val - a.val);
+    const filtered = [];
+    for (const l of lines) {
+      if (!filtered.some(fl => Math.abs(fl.y - l.y) < 22)) filtered.push(l);
+    }
+    filtered.sort((a, b) => a.y - b.y);
+
+    // Compute horizontal normalized ink vector for each line
+    for (const line of filtered) {
+      const prof = new Float32Array(item.validW);
+      const sy = Math.max(0, line.y - 7);
+      const ey = Math.min(item.validH - 1, line.y + 7);
+      for (let x = 60; x < item.validW - 60; x++) {
+        let sum = 0;
+        for (let y = sy; y <= ey; y++) {
+          sum += item.ink[y * item.validW + x];
+        }
+        prof[x] = sum;
+      }
+      let sum = 0, cnt = 0;
+      for (let x = 80; x < item.validW - 80; x++) {
+        sum += prof[x]; cnt++;
+      }
+      const mean = sum / cnt;
+      let varS = 0;
+      const norm = new Float32Array(item.validW);
+      for (let x = 80; x < item.validW - 80; x++) {
+        const v = prof[x] - mean;
+        norm[x] = v;
+        varS += v * v;
+      }
+      line.norm = norm;
+      line.std = Math.sqrt(varS);
+    }
+    item.lines = filtered;
+  }
+
+  function verifyLineMatch(upper, lower, overlapH, dx) {
+    const H = upper.validH;
+    let maxLineZ = 0;
+    let matchedLines = 0;
+
+    for (const lu of upper.lines) {
+      if (lu.y < H - overlapH - 10) continue; // outside overlap
+      const expectedLy = lu.y - (H - overlapH);
+      for (const ll of lower.lines) {
+        if (Math.abs(ll.y - expectedLy) <= 12) {
+          // Compare line norms
+          if (lu.std > 20 && ll.std > 20) {
+            let cov = 0;
+            const W = upper.validW;
+            for (let x = 90; x < W - 90; x++) {
+              cov += lu.norm[x] * ll.norm[x + dx];
+            }
+            const lz = cov / (lu.std * ll.std);
+            if (lz > maxLineZ) maxLineZ = lz;
+            if (lz >= 0.40) matchedLines++;
+          }
+        }
+      }
+    }
+    return { maxLineZ, matchedLines };
+  }
+
+  function evaluateDirectedOverlap(upper, lower) {
+    const W = upper.validW;
+    const H = upper.validH;
+    let bestZ = -1;
+    let bestOverlap = 0;
+    let bestDx = 0;
+
+    // Coarse sweep of overlap heights (35px to H-25px, step 4) with dx sampling [-10, 0, 10]
+    for (let ov = 35; ov <= H - 25; ov += 4) {
+      for (let cDx of [-10, 0, 10]) {
+        let s1 = 0, s2 = 0, count = 0;
+        for (let y = 0; y < ov; y += 4) {
+          const r1 = (H - ov + y) * W;
+          const r2 = y * W;
+          for (let x = 80; x < W - 80; x += 8) {
+            s1 += upper.ink[r1 + x];
+            s2 += lower.ink[r2 + x + cDx];
+            count++;
+          }
+        }
+        const m1 = s1 / count;
+        const m2 = s2 / count;
+
+        let cov = 0, v1 = 0, v2 = 0;
+        for (let y = 0; y < ov; y += 4) {
+          const r1 = (H - ov + y) * W;
+          const r2 = y * W;
+          for (let x = 80; x < W - 80; x += 8) {
+            const d1 = upper.ink[r1 + x] - m1;
+            const d2 = lower.ink[r2 + x + cDx] - m2;
+            cov += d1 * d2;
+            v1 += d1 * d1;
+            v2 += d2 * d2;
+          }
+        }
+
+        if (v1 > 100 && v2 > 100) {
+          const z = cov / (Math.sqrt(v1) * Math.sqrt(v2));
+          if (z > bestZ) {
+            bestZ = z;
+            bestOverlap = ov;
+            bestDx = cDx;
+          }
+        }
+      }
+    }
+
+    // Refinement around coarse peak: sweep ov in [-6, 6] and dx in [-12, 12]
+    if (bestZ > 0.22) {
+      let refinedZ = bestZ;
+      let refinedOv = bestOverlap;
+      let refinedDx = bestDx;
+      const minOv = Math.max(35, bestOverlap - 8);
+      const maxOv = Math.min(H - 25, bestOverlap + 8);
+
+      for (let ov = minOv; ov <= maxOv; ov++) {
+        for (let dx = Math.max(-14, bestDx - 4); dx <= Math.min(14, bestDx + 4); dx += 2) {
+          let s1 = 0, s2 = 0, count = 0;
+          for (let y = 0; y < ov; y += 2) {
+            const r1 = (H - ov + y) * W;
+            const r2 = y * W;
+            for (let x = 80; x < W - 80; x += 4) {
+              s1 += upper.ink[r1 + x];
+              s2 += lower.ink[r2 + x + dx];
+              count++;
+            }
+          }
+          const m1 = s1 / count;
+          const m2 = s2 / count;
+
+          let cov = 0, v1 = 0, v2 = 0;
+          for (let y = 0; y < ov; y += 2) {
+            const r1 = (H - ov + y) * W;
+            const r2 = y * W;
+            for (let x = 80; x < W - 80; x += 4) {
+              const d1 = upper.ink[r1 + x] - m1;
+              const d2 = lower.ink[r2 + x + dx] - m2;
+              cov += d1 * d2;
+              v1 += d1 * d1;
+              v2 += d2 * d2;
+            }
+          }
+
+          if (v1 > 100 && v2 > 100) {
+            const z = cov / (Math.sqrt(v1) * Math.sqrt(v2));
+            if (z > refinedZ) {
+              refinedZ = z;
+              refinedOv = ov;
+              refinedDx = dx;
+            }
+          }
+        }
+      }
+
+      // Verify candidate with line fingerprint matcher
+      const lineCheck = verifyLineMatch(upper, lower, refinedOv, refinedDx);
+      if (['real_6', 'real_3', 'real_2'].includes(upper.id) && ['real_4', 'real_2', 'real_1'].includes(lower.id)) {
+        log(`DEBUG PAIR ${upper.id} -> ${lower.id}: refinedZ=${refinedZ.toFixed(3)}, ov=${refinedOv}, dx=${refinedDx}, lineCheck:`, lineCheck);
+      }
+      // If line verification fails (no line has z >= 0.40 and not strong multi-line), reject false match
+      if (lineCheck.maxLineZ < 0.38 && lineCheck.matchedLines === 0 && refinedZ < 0.50) {
+        return { score: 0, overlapH: 0, dx: 0, seamCut: 0, contentDiff: 1 };
+      }
+
+      // Compute seamCut at the minimum ink valley between text lines
+      let seamCut = Math.floor(refinedOv / 2);
+      let minCombinedInk = Infinity;
+      const seamSearchStart = Math.max(5, Math.floor(refinedOv * 0.15));
+      const seamSearchEnd = Math.min(refinedOv - 5, Math.floor(refinedOv * 0.85));
+
+      for (let y = seamSearchStart; y <= seamSearchEnd; y++) {
+        const p1 = upper.hProj[H - refinedOv + y];
+        const p2 = lower.hProj[y];
+        const combined = p1 + p2;
+        if (combined < minCombinedInk) {
+          minCombinedInk = combined;
+          seamCut = y;
+        }
+      }
+
+      return {
+        score: refinedZ,
+        overlapH: refinedOv,
+        dx: refinedDx,
+        seamCut,
+        contentDiff: Math.max(0, 1 - refinedZ)
+      };
+    }
+
+    return { score: 0, overlapH: 0, dx: 0, seamCut: 0, contentDiff: 1 };
+  }
+
+  const results = [];
+  for (const a of names) {
+    for (const b of names) {
+      if (a === b) continue;
+      const res = evaluateDirectedOverlap(loaded[a], loaded[b]);
+      if (res.score >= 0.25) {
+        results.push({
+          from: a,
+          to: b,
+          score: parseFloat(res.score.toFixed(3)),
+          overlapH: res.overlapH,
+          dx: res.dx,
+          seamCut: res.seamCut
+        });
+      }
+    }
+  }
+
+  results.sort((x, y) => y.score - x.score);
+  await log('ZNCC Directed Matches (score >= 0.25):', results);
+
+  await fetch('/test-result', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ok: true, results })
+  });
+}
+run();
+</script>
+</body>
+</html>
