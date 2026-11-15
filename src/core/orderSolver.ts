@@ -1,15 +1,18 @@
 import type { MatchResult, StitchGroup, ImageItem } from '../types'
 
-interface Edge {
+interface DirectedEdge {
   from: string
   to: string
   score: number
+  overlapH: number
+  dx: number
   match: MatchResult
 }
 
 /**
- * Given all images and their pairwise match results,
- * determine the correct linear order and group independent chains.
+ * 全局最优路径阅读顺序与分组求解器：
+ * 采用有向无环最长链搜索算法，最大化将具有上下重叠关系的图片连接在同一链条中，
+ * 彻底防止过度拆分（如将 7 张图拆为 3 组的问题），同时尊重用户锁定的位置。
  */
 export function solveOrder(
   images: ImageItem[],
@@ -23,16 +26,22 @@ export function solveOrder(
 
   const idSet = new Set(images.map(i => i.id))
 
-  // Build directed edges from matches
-  const edges: Edge[] = []
+  // 1. 整理所有候选有向边
+  const edges: DirectedEdge[] = []
   for (const match of matches) {
-    if (match.score < 0.1 || match.confidence === 'none') continue
+    if (match.score < 0.38 || match.confidence === 'none') continue
     if (!idSet.has(match.imageIdA) || !idSet.has(match.imageIdB)) continue
 
     if (match.direction === 'A_before_B') {
-      edges.push({ from: match.imageIdA, to: match.imageIdB, score: match.score, match })
+      edges.push({
+        from: match.imageIdA,
+        to: match.imageIdB,
+        score: match.score,
+        overlapH: match.overlapHeightA,
+        dx: match.offsetX,
+        match,
+      })
     } else if (match.direction === 'B_before_A') {
-      // Restate as B -> A
       const reversed: MatchResult = {
         ...match,
         imageIdA: match.imageIdB,
@@ -43,124 +52,155 @@ export function solveOrder(
         overlapHeightB: match.overlapHeightA,
         direction: 'A_before_B',
       }
-      edges.push({ from: match.imageIdB, to: match.imageIdA, score: match.score, match: reversed })
+      edges.push({
+        from: match.imageIdB,
+        to: match.imageIdA,
+        score: match.score,
+        overlapH: match.overlapHeightB,
+        dx: -match.offsetX,
+        match: reversed,
+      })
     }
   }
 
-  // Union-Find for connected components
-  const parent: Record<string, string> = {}
-  const rank: Record<string, number> = {}
-  for (const img of images) {
-    parent[img.id] = img.id
-    rank[img.id] = 0
-  }
-
-  function find(x: string): string {
-    if (parent[x] !== x) parent[x] = find(parent[x])
-    return parent[x]
-  }
-
-  function union(x: string, y: string) {
-    const px = find(x), py = find(y)
-    if (px === py) return
-    if (rank[px] < rank[py]) parent[px] = py
-    else if (rank[px] > rank[py]) parent[py] = px
-    else { parent[py] = px; rank[px]++ }
-  }
-
-  // Build chains: each node can have at most 1 predecessor and 1 successor
-  const outEdge: Record<string, Edge | undefined> = {}
-  const inEdge: Record<string, Edge | undefined> = {}
-  const usedEdges: Edge[] = []
-
-  // Sort by score descending - greedy but handles cycles
-  const sortedEdges = [...edges].sort((a, b) => b.score - a.score)
-
-  for (const edge of sortedEdges) {
-    if (outEdge[edge.from]) continue  // from already has a successor
-    if (inEdge[edge.to]) continue    // to already has a predecessor
-    if (find(edge.from) === find(edge.to)) continue // would create cycle
-
-    // Respect locked positions: locked nodes keep their relative order
-    if (lockedPositions) {
-      const fromLock = lockedPositions.get(edge.from)
-      const toLock = lockedPositions.get(edge.to)
-      if (fromLock !== undefined && toLock !== undefined && fromLock >= toLock) {
-        continue // locked order conflict
-      }
+  // 过滤与用户锁定位置冲突的边
+  const validEdges = edges.filter(e => {
+    if (!lockedPositions) return true
+    const fromLock = lockedPositions.get(e.from)
+    const toLock = lockedPositions.get(e.to)
+    if (fromLock !== undefined && toLock !== undefined && fromLock >= toLock) {
+      return false
     }
+    return true
+  })
 
-    union(edge.from, edge.to)
-    outEdge[edge.from] = edge
-    inEdge[edge.to] = edge
-    usedEdges.push(edge)
-  }
-
-  // Build connected components
-  const components = new Map<string, string[]>()
+  // 2. 构建邻接表
+  const adj = new Map<string, DirectedEdge[]>()
   for (const img of images) {
-    const p = find(img.id)
-    if (!components.has(p)) components.set(p, [])
-    components.get(p)!.push(img.id)
+    adj.set(img.id, [])
+  }
+  for (const edge of validEdges) {
+    adj.get(edge.from)?.push(edge)
   }
 
+  // 3. 递归/动态规划搜索最长权重路径（覆盖最多节点优先，其次得分最高）
+  const allIds = images.map(i => i.id)
+  const remainingIds = new Set(allIds)
   const groups: StitchGroup[] = []
   let groupId = 0
 
-  for (const [, compIds] of components) {
-    // Find start node (no predecessor in this component)
-    const compSet = new Set(compIds)
-    const startNodes = compIds.filter(id => !inEdge[id] || !compSet.has(inEdge[id]!.from))
+  while (remainingIds.size > 0) {
+    let bestChain: string[] = []
+    let bestScore = -Infinity
 
-    let startNode = startNodes[0]
-    if (!startNode) startNode = compIds[0]
+    function dfs(
+      currId: string,
+      visited: Set<string>,
+      path: string[],
+      score: number
+    ) {
+      if (
+        path.length > bestChain.length ||
+        (path.length === bestChain.length && score > bestScore)
+      ) {
+        bestChain = [...path]
+        bestScore = score
+      }
 
-    // Walk chain
-    const ordered: string[] = [startNode]
-    const visited = new Set([startNode])
-    let current = startNode
+      const neighbors = adj.get(currId) || []
+      for (const edge of neighbors) {
+        if (remainingIds.has(edge.to) && !visited.has(edge.to)) {
+          // 边权重 = 匹配置信度得分 * 重叠高度因子（重叠行数越多，证据越确凿，防止 1 行文本的短重叠截断长链路）
+          const overlapFactor = Math.min(1.2, Math.max(0.3, edge.overlapH / 100))
+          const edgeWeight = edge.score * overlapFactor
 
-    while (outEdge[current] && compSet.has(outEdge[current]!.to)) {
-      const next = outEdge[current]!.to
-      if (visited.has(next)) break // cycle guard
-      ordered.push(next)
-      visited.add(next)
-      current = next
+          visited.add(edge.to)
+          path.push(edge.to)
+          dfs(edge.to, visited, path, score + edgeWeight)
+          path.pop()
+          visited.delete(edge.to)
+        }
+      }
     }
 
-    // Add any nodes not reached
-    for (const id of compIds) {
-      if (!visited.has(id)) ordered.push(id)
+    for (const startId of remainingIds) {
+      const visited = new Set([startId])
+      dfs(startId, visited, [startId], 0)
     }
 
-    // Gather match results for this group
-    const groupMatches = usedEdges
-      .filter(e => compSet.has(e.from) && compSet.has(e.to))
-      .map(e => e.match)
+    if (bestChain.length === 0) {
+      // 兜底：取剩余的第一个独立图片
+      const firstRem = Array.from(remainingIds)[0]
+      bestChain = [firstRem]
+    }
 
-    groups.push({ id: groupId++, imageIds: ordered, matches: groupMatches })
+    // 移除已分配给当前组的节点
+    for (const id of bestChain) {
+      remainingIds.delete(id)
+    }
+
+    // 收集该组使用的匹配结果
+    const groupMatches: MatchResult[] = []
+    for (let i = 0; i < bestChain.length - 1; i++) {
+      const u = bestChain[i]
+      const v = bestChain[i + 1]
+      const edge = validEdges.find(e => e.from === u && e.to === v)
+      if (edge) groupMatches.push(edge.match)
+    }
+
+    groups.push({
+      id: groupId++,
+      imageIds: bestChain,
+      matches: groupMatches,
+    })
   }
 
-  // Sort groups by size (largest first)
+  // 按组内包含的图片数量降序排列（主拼接组排最前）
   groups.sort((a, b) => b.imageIds.length - a.imageIds.length)
 
   return groups
 }
 
 /**
- * Detect exact duplicate images by comparing feature counts and rough positions
+ * 精确检测完全重复图片与近重复草稿截图
  */
 export function detectDuplicates(
-  _images: ImageItem[],
+  images: ImageItem[],
   matches: MatchResult[]
 ): Set<string> {
   const duplicates = new Set<string>()
 
+  // 计算每张图片的有效墨迹密度（手写笔记与文字量）
+  const inkMap = new Map<string, number>()
+  for (const img of images) {
+    if (img.canvasFeature) {
+      let sum = 0
+      for (let i = 0; i < img.canvasFeature.ink.length; i++) {
+        sum += img.canvasFeature.ink[i]
+      }
+      inkMap.set(img.id, sum)
+    }
+  }
+
   for (const m of matches) {
-    // Very high score (>0.95) with minimal offset = likely duplicate
-    if (m.score > 0.95 && Math.abs(m.offsetX) < 5 && Math.abs(m.offsetY) < 5) {
-      // Mark the second one as duplicate
+    // 1. 完全相同图片 (score > 0.95 且位移接近 0)
+    if (m.score > 0.95 && Math.abs(m.offsetX) < 4 && Math.abs(m.offsetY) < 4) {
       duplicates.add(m.imageIdB)
+    }
+    // 2. 同一屏增量草稿截图 (重叠率超 80%，位移极小，内容相似)
+    else if (
+      m.score >= 0.70 &&
+      (m.overlapHeightA > 450 || m.overlapHeightB > 450) &&
+      Math.abs(m.offsetY) < 35
+    ) {
+      const inkA = inkMap.get(m.imageIdA) || 0
+      const inkB = inkMap.get(m.imageIdB) || 0
+      // 保留板书笔记更丰富的一张，去除草稿未批注的一张
+      if (inkA < inkB) {
+        duplicates.add(m.imageIdA)
+      } else {
+        duplicates.add(m.imageIdB)
+      }
     }
   }
 

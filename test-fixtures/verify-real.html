@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Real Images Full Production Verification</title>
+</head>
+<body>
+<div id="status">Testing Production Pipeline...</div>
+<script type="module">
+function logMsg(msg, data) {
+  fetch('/test-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg, data })
+  }).catch(() => {});
+}
+
+window.addEventListener('error', (e) => {
+  logMsg('WINDOW_ERROR: ' + e.message, { filename: e.filename, lineno: e.lineno });
+});
+
+window.addEventListener('unhandledrejection', (e) => {
+  logMsg('UNHANDLED_REJECTION: ' + (e.reason?.message || String(e.reason)));
+});
+
+import { runPipeline } from '../src/core/pipeline.ts';
+
+async function runTest() {
+  logMsg('=== Production Pipeline Real Images E2E Test Started ===');
+  const report = {
+    steps: [],
+    errors: [],
+    success: false,
+    groups: [],
+    pairMatches: [],
+    borders: [],
+    canvases: [],
+    orderCorrect: false,
+    qualityReport: null,
+    darkRowsCount: 0
+  };
+
+  try {
+    // Deliberately scrambled upload order
+    const shuffledNames = [
+      'real_3.jpg',
+      'real_1.jpg',
+      'real_7.jpg',
+      'real_4.jpg',
+      'real_2.jpg',
+      'real_6.jpg',
+      'real_5.jpg'
+    ];
+
+    const imageItems = [];
+
+    for (let name of shuffledNames) {
+      logMsg('Loading ' + name);
+      const res = await fetch('/real-img/' + name);
+      const blob = await res.blob();
+      const bitmap = await createImageBitmap(blob);
+
+      imageItems.push({
+        id: name.replace('.jpg', ''),
+        file: new File([blob], name, { type: 'image/jpeg' }),
+        name: name,
+        width: bitmap.width,
+        height: bitmap.height,
+        size: blob.size,
+        dataUrl: '',
+        originalBitmap: bitmap,
+        blackBorderTop: 0,
+        blackBorderBottom: 0,
+        blackBorderLeft: 0,
+        blackBorderRight: 0,
+        locked: false
+      });
+    }
+
+    logMsg('Images loaded, running pipeline with autoSort=true, removeBlackBorders=true, removeDuplicates=true, autoAlign=true...');
+
+    const pipelineResult = await runPipeline(
+      imageItems,
+      {
+        autoSort: true,
+        removeBlackBorders: true,
+        autoAlign: true,
+        removeDuplicates: true,
+        enableOCR: false
+      },
+      {
+        onProgress: (step, pct, msg, engine) => {
+          logMsg(`PROGRESS: [${step}] ${pct}%: ${msg} (${engine || ''})`);
+        },
+        onError: (err) => {
+          logMsg('PIPELINE_ONERROR: ' + err.message);
+          report.errors.push(err.message);
+        },
+        isCancelled: () => false
+      },
+      '#ffffff'
+    );
+
+    if (!pipelineResult) {
+      throw new Error('Pipeline returned null');
+    }
+
+    const { groups, matchResults, stitchedCanvases, engineUsed, qualityReports } = pipelineResult;
+    report.engineUsed = engineUsed;
+    report.groups = groups.map(g => ({ id: g.id, imageIds: g.imageIds }));
+
+    report.pairMatches = (matchResults || []).map(m => ({
+      a: m.imageIdA,
+      b: m.imageIdB,
+      direction: m.direction,
+      score: m.score,
+      overlapH: m.overlapHeightA,
+      confidence: m.confidence
+    }));
+
+    report.borders = imageItems.map(img => ({
+      id: img.id,
+      w: img.width,
+      h: img.height,
+      top: img.blackBorderTop,
+      bottom: img.blackBorderBottom,
+      left: img.blackBorderLeft,
+      right: img.blackBorderRight
+    }));
+
+    const expectedOrder = ['real_7', 'real_6', 'real_4', 'real_5', 'real_3', 'real_2', 'real_1'];
+    const group0 = groups[0];
+    report.orderCorrect = JSON.stringify(group0.imageIds) === JSON.stringify(expectedOrder);
+    logMsg('Group 0 recovered sequence:', group0.imageIds);
+    logMsg('Matches ground truth expected?', report.orderCorrect);
+
+    if (qualityReports && qualityReports.has(group0.id)) {
+      const qr = qualityReports.get(group0.id);
+      report.qualityReport = {
+        overallScore: qr.overallScore,
+        rating: qr.rating,
+        totalSeams: qr.metrics.totalSeams,
+        highConfidenceSeams: qr.metrics.highConfidenceSeams,
+        averageOverlapH: qr.metrics.averageOverlapH,
+        warnings: qr.warnings
+      };
+      logMsg('Quality Assessment:', report.qualityReport);
+    }
+
+    for (const group of groups) {
+      const canvas = stitchedCanvases.get(group.id);
+      if (canvas) {
+        // Inspect black rows on stitched canvas
+        const osc = new OffscreenCanvas(canvas.width, canvas.height);
+        const octx = osc.getContext('2d');
+        octx.drawImage(canvas, 0, 0);
+        const d = octx.getImageData(0, 0, canvas.width, canvas.height).data;
+        const w = canvas.width;
+        const h = canvas.height;
+        let darkCount = 0;
+        for (let y = 0; y < h; y++) {
+          let rowDark = 0;
+          for (let x = 0; x < w; x++) {
+            const idx = (y * w + x) * 4;
+            const b = (d[idx] + d[idx+1] + d[idx+2]) / 3;
+            if (b < 80) rowDark++;
+          }
+          if (rowDark / w > 0.60) darkCount++;
+        }
+        report.darkRowsCount = darkCount;
+
+        const blob = await canvas.convertToBlob({ type: 'image/png' });
+        const reader = new FileReader();
+        await new Promise((resolve) => {
+          reader.onloadend = () => {
+            report.canvases.push({
+              groupId: group.id,
+              w: canvas.width,
+              h: canvas.height,
+              dataUrl: reader.result
+            });
+            resolve();
+          };
+          reader.readAsDataURL(blob);
+        });
+      }
+    }
+
+    report.success = true;
+    logMsg('Sending real production test-result...');
+    fetch('/test-result', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report)
+    });
+
+  } catch (err) {
+    logMsg('CATCH_ERROR: ' + err.message, { stack: err.stack });
+    report.errors.push(err.message);
+    fetch('/test-result', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report)
+    });
+  }
+}
+
+runTest();
+</script>
+</body>
+</html>

@@ -1,8 +1,8 @@
 /**
  * 智能流水线调度器 (Smart Pipeline Coordinator)
- * 具备双引擎架构：
+ * 具备双引擎架构与文档截图专用匹配器：
  * 1. 深度引擎：OpenCV.js (ORB 特征提取 + RANSAC 对齐)
- * 2. 备用引擎：HTML5 Canvas (2D 文本笔画与前景匹配)
+ * 2. 备用与文档引擎：HTML5 Canvas (2D 文本笔画、投影相关、词间间隙指纹与空白谷底无损接缝)
  *
  * 保证零阻塞、百分之百可用、平滑回退、严格遵循用户设定。
  */
@@ -14,6 +14,7 @@ import { extractCanvasFeatures, matchImagesCanvas } from './canvasFallbackMatche
 import { solveOrder, detectDuplicates } from './orderSolver'
 import { removeBlackBorders } from './blackBorderRemover'
 import { stitchGroup } from './stitcher'
+import { assessStitchQuality, type StitchQualityReport } from './qualityAssessor'
 import type { ImageItem, MatchResult, AppSettings, StitchGroup } from '../types'
 
 export interface PipelineCallbacks {
@@ -27,6 +28,7 @@ export interface PipelineResult {
   matchResults: MatchResult[]
   stitchedCanvases: Map<number, OffscreenCanvas>
   engineUsed: 'opencv' | 'canvas'
+  qualityReports: Map<number, StitchQualityReport>
 }
 
 function yieldToMain(): Promise<void> {
@@ -54,9 +56,8 @@ export async function runPipeline(
       engine = 'opencv'
       onProgress('loading-cv', 100, '计算机视觉引擎 (OpenCV.js) 就绪', 'opencv')
     } else {
-      // 优先启用原生轻量高性能 Canvas 引擎，杜绝主线程卡死
       engine = 'canvas'
-      onProgress('loading-cv', 100, '已启用原生高性能 Canvas 图像引擎', 'canvas')
+      onProgress('loading-cv', 100, '已启用原生文档与长截图高精度图像引擎', 'canvas')
     }
     await yieldToMain()
     if (isCancelled()) return null
@@ -96,32 +97,19 @@ export async function runPipeline(
       const img = images[i]
       if (!img.originalBitmap) continue
 
-      if (engine === 'opencv') {
-        if (!img.features) {
-          try {
-            img.features = await extractORBFeatures(
-              img.originalBitmap,
-              img.id,
-              img.blackBorderTop,
-              img.blackBorderBottom,
-              img.blackBorderLeft,
-              img.blackBorderRight
-            )
-          } catch (e) {
-            console.warn('ORB 特征提取异常，降级为 Canvas 特征:', e)
-            img.canvasFeature = await extractCanvasFeatures(
-              img.originalBitmap,
-              img.id,
-              img.blackBorderTop,
-              img.blackBorderBottom,
-              img.blackBorderLeft,
-              img.blackBorderRight
-            )
-          }
-        }
-      } else {
-        if (!img.canvasFeature) {
-          img.canvasFeature = await extractCanvasFeatures(
+      // 文档与笔记特征分析（无论 OpenCV 是否可用，都计算文档投影与笔迹指纹）
+      img.canvasFeature = await extractCanvasFeatures(
+        img.originalBitmap,
+        img.id,
+        img.blackBorderTop,
+        img.blackBorderBottom,
+        img.blackBorderLeft,
+        img.blackBorderRight
+      )
+
+      if (engine === 'opencv' && !img.features) {
+        try {
+          img.features = await extractORBFeatures(
             img.originalBitmap,
             img.id,
             img.blackBorderTop,
@@ -129,6 +117,8 @@ export async function runPipeline(
             img.blackBorderLeft,
             img.blackBorderRight
           )
+        } catch (e) {
+          console.warn('ORB 特征提取降级:', e)
         }
       }
 
@@ -162,19 +152,12 @@ export async function runPipeline(
       try {
         let matchRes: MatchResult | null = null
 
-        if (engine === 'opencv' && imgA.features && imgB.features) {
+        if (imgA.canvasFeature && imgB.canvasFeature) {
+          matchRes = await matchImagesCanvas(imgA.canvasFeature, imgB.canvasFeature)
+        } else if (engine === 'opencv' && imgA.features && imgB.features) {
           const hA = Math.max(10, imgA.height - imgA.blackBorderTop - imgA.blackBorderBottom)
           const hB = Math.max(10, imgB.height - imgB.blackBorderTop - imgB.blackBorderBottom)
-          matchRes = await matchImages(
-            imgA.id,
-            imgA.features,
-            hA,
-            imgB.id,
-            imgB.features,
-            hB
-          )
-        } else if (imgA.canvasFeature && imgB.canvasFeature) {
-          matchRes = await matchImagesCanvas(imgA.canvasFeature, imgB.canvasFeature)
+          matchRes = await matchImages(imgA.id, imgA.features, hA, imgB.id, imgB.features, hB)
         }
 
         if (matchRes && matchRes.confidence !== 'none') {
@@ -231,6 +214,7 @@ export async function runPipeline(
     // --- Step 6: 自动对齐与无缝拼接 ---
     onProgress('stitching', 0, '正在合成高清长图...', engine)
     const stitchedCanvases = new Map<number, OffscreenCanvas>()
+    const qualityReports = new Map<number, StitchQualityReport>()
 
     for (let gi = 0; gi < groups.length; gi++) {
       if (isCancelled()) return null
@@ -249,6 +233,10 @@ export async function runPipeline(
           }
         )
         stitchedCanvases.set(group.id, result.canvas)
+
+        // 进行拼接质量评估
+        const qualityReport = assessStitchQuality(group, images, matchResults)
+        qualityReports.set(group.id, qualityReport)
       } catch (e) {
         console.error('Group stitching error:', group.id, e)
       }
@@ -262,7 +250,7 @@ export async function runPipeline(
       await yieldToMain()
     }
 
-    return { groups, matchResults, stitchedCanvases, engineUsed: engine }
+    return { groups, matchResults, stitchedCanvases, engineUsed: engine, qualityReports }
   } catch (err) {
     onError(err instanceof Error ? err : new Error(String(err)))
     return null

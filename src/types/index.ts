@@ -56,6 +56,7 @@ export interface MatchResult {
   confidence: 'high' | 'medium' | 'low' | 'none'
   direction: 'A_before_B' | 'B_before_A' | 'unknown'
   inlierCount: number
+  seamCut?: number
 }
 
 export interface StitchGroup {

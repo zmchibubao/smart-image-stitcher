@@ -8,9 +8,11 @@ const canvasRef = ref<HTMLCanvasElement>()
 const activeGroupId = ref(0)
 const zoom = ref(1)
 const isLoading = ref(false)
+const showDebugPanel = ref(false)
 
 const groups = computed(() => store.stitchGroups)
 const activeCanvas = computed(() => store.stitchedCanvases.get(activeGroupId.value))
+const activeQualityReport = computed(() => store.qualityReports.get(activeGroupId.value))
 
 async function updatePreview() {
   await nextTick()
@@ -55,6 +57,74 @@ const canvasSize = computed(() => {
       >
         第 {{ g.id + 1 }} 组 ({{ g.imageIds.length }} 张)
       </button>
+    </div>
+
+    <!-- Quality Score Badge & Assessment Banner -->
+    <div v-if="activeQualityReport" class="quality-banner">
+      <div class="quality-main">
+        <div class="quality-score-box">
+          <span class="score-num">{{ activeQualityReport.overallScore }}</span>
+          <span class="score-unit">分</span>
+        </div>
+        <div class="quality-text">
+          <div class="quality-title-line">
+            <span class="quality-title">拼接质量评估：</span>
+            <span
+              class="quality-tag"
+              :class="{
+                'tag-perfect': activeQualityReport.overallScore >= 90,
+                'tag-good': activeQualityReport.overallScore >= 75 && activeQualityReport.overallScore < 90,
+                'tag-warning': activeQualityReport.overallScore < 75
+              }"
+            >
+              {{ activeQualityReport.rating }}
+            </span>
+          </div>
+          <div class="quality-metrics-line">
+            <span>接缝总数: {{ activeQualityReport.metrics.totalSeams }} 处</span>
+            <span>高置信对齐: {{ activeQualityReport.metrics.highConfidenceSeams }} 处</span>
+            <span>平均重叠: {{ activeQualityReport.metrics.averageOverlapH }} px</span>
+          </div>
+        </div>
+      </div>
+      <button
+        class="btn btn-secondary btn-sm debug-toggle-btn"
+        @click="showDebugPanel = !showDebugPanel"
+      >
+        {{ showDebugPanel ? '收起调试分析 ▲' : '接缝与重叠调试 ▼' }}
+      </button>
+    </div>
+
+    <!-- Warnings if any -->
+    <div v-if="activeQualityReport?.warnings && activeQualityReport.warnings.length > 0" class="warning-box">
+      <div v-for="(w, idx) in activeQualityReport.warnings" :key="idx" class="warning-item">
+        ⚠️ {{ w }}
+      </div>
+    </div>
+
+    <!-- Collapsible Seam Debug Details -->
+    <div v-if="showDebugPanel && activeQualityReport" class="debug-panel">
+      <h4 class="debug-title">🔍 接缝与重叠对齐细节（开发调试模式）</h4>
+      <div class="seam-list">
+        <div
+          v-for="(s, sidx) in activeQualityReport.seamQualities"
+          :key="sidx"
+          class="seam-item"
+          :class="`seam-${s.status}`"
+        >
+          <div class="seam-header">
+            <span class="seam-pair">接缝 {{ sidx + 1 }}: {{ s.upperName }} ➔ {{ s.lowerName }}</span>
+            <span class="seam-status-badge">{{ s.status === 'perfect' ? '✅ 完美对齐' : s.status === 'good' ? '✨ 良好无缝' : '⚠️ 需检查' }}</span>
+          </div>
+          <div class="seam-body">
+            <span>重叠高度: <strong>{{ s.overlapH }}px</strong></span>
+            <span>水平偏移: <strong>{{ s.dx }}px</strong></span>
+            <span>无损接缝行: <strong>第 {{ s.seamY }} 行 (空白谷底)</strong></span>
+            <span>匹配置信度: <strong>{{ s.matchScore }}% ({{ s.alignmentConfidence }})</strong></span>
+          </div>
+          <div v-if="s.note" class="seam-note">{{ s.note }}</div>
+        </div>
+      </div>
     </div>
 
     <!-- Toolbar -->
@@ -112,6 +182,155 @@ const canvasSize = computed(() => {
   background: var(--primary);
   color: white;
   border-color: var(--primary);
+}
+
+.quality-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.quality-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.quality-score-box {
+  background: var(--primary-light, #e0e7ff);
+  color: var(--primary, #4338ca);
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+}
+
+.score-num {
+  font-size: 20px;
+}
+
+.score-unit {
+  font-size: 11px;
+}
+
+.quality-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.quality-title-line {
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.quality-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.tag-perfect {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.tag-good {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.tag-warning {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.quality-metrics-line {
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 12px;
+}
+
+.warning-box {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.warning-item {
+  font-size: 12px;
+  color: #b45309;
+}
+
+.debug-panel {
+  background: var(--bg-tertiary, #f8fafc);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.debug-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.seam-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.seam-item {
+  background: var(--bg-card, #ffffff);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.seam-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.seam-body {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.seam-note {
+  font-size: 11px;
+  color: #d97706;
 }
 
 .preview-toolbar {

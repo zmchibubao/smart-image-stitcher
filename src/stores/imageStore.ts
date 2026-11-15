@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import type { StitchQualityReport } from '../core/qualityAssessor'
 import type {
   ImageItem,
   MatchResult,
@@ -60,6 +61,7 @@ export const useImageStore = defineStore('image', () => {
   const isUserManuallyOrdered = ref(false)
   const isCancelled = ref(false)
   const stitchedCanvases = ref<Map<number, OffscreenCanvas>>(new Map())
+  const qualityReports = ref<Map<number, StitchQualityReport>>(new Map())
   const activeEngine = ref<'opencv' | 'canvas'>('canvas')
 
   const settings = ref<AppSettings>({
@@ -174,6 +176,7 @@ export const useImageStore = defineStore('image', () => {
     autoOrder.value = []
     isUserManuallyOrdered.value = false
     stitchedCanvases.value.clear()
+    qualityReports.value.clear()
     processStatus.value = { step: 'idle', progress: 0, message: '等待上传图片' }
   }
 
@@ -282,6 +285,10 @@ export const useImageStore = defineStore('image', () => {
     stitchedCanvases.value.set(groupId, canvas)
   }
 
+  function setQualityReports(reports: Map<number, StitchQualityReport>) {
+    qualityReports.value = reports
+  }
+
   function setActiveEngine(eng: 'opencv' | 'canvas') {
     activeEngine.value = eng
   }
@@ -298,6 +305,7 @@ export const useImageStore = defineStore('image', () => {
     exportOptions,
     isCancelled,
     stitchedCanvases,
+    qualityReports,
     activeEngine,
     orderedImages,
     isProcessing,
@@ -319,6 +327,7 @@ export const useImageStore = defineStore('image', () => {
     cancelProcessing,
     resetCancel,
     setStitchedCanvas,
+    setQualityReports,
     setActiveEngine,
   }
 })

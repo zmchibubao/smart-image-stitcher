@@ -86,6 +86,9 @@ async function startProcessing() {
     for (const [gid, canvas] of result.stitchedCanvases) {
       store.setStitchedCanvas(gid, canvas)
     }
+    if (result.qualityReports) {
+      store.setQualityReports(result.qualityReports)
+    }
     store.setProcessStatus({
       step: 'done',
       progress: 100,
